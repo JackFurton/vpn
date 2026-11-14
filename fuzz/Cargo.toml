@@ -1,0 +1,39 @@
+[package]
+name = "vpn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.5", features = ["derive"] }
+libfuzzer-sys = "0.4.13"
+vpn-proto = { path = "../crates/vpn-proto" }
+
+# Separate workspace: fuzzing needs nightly and sanitizer flags the main
+# workspace shouldn't inherit.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "wire_parse"
+path = "fuzz_targets/wire_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replay_window"
+path = "fuzz_targets/replay_window.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device"
+path = "fuzz_targets/device.rs"
+test = false
+doc = false
+bench = false
