@@ -1,0 +1,15 @@
+# Client that sends only tunnel-subnet traffic through the VPN.
+# This file holds a private key: chmod 600 it.
+
+[interface]
+private_key = "<PRIVATE_KEY>"
+# No listen_port: a random one is fine since the server never dials us.
+addresses = ["10.8.0.2/24"]
+
+[[peer]]
+public_key = "<PEER_PUBLIC_KEY>"
+endpoint = "203.0.113.10:51820"
+# Use ["0.0.0.0/0", "::/0"] to send all traffic through the server.
+allowed_ips = ["10.8.0.0/24"]
+# Send a keepalive every 25s so NAT on our side doesn't forget the mapping.
+persistent_keepalive = 25
