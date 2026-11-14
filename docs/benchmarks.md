@@ -12,8 +12,8 @@ cargo build --release -p vpnd && sudo tests/bench.sh target/release/vpnd
 both on a GitHub runner, on demand and on PRs that touch the benchmarks:
 https://github.com/JackFurton/vpn/actions/workflows/bench.yml
 
-Numbers below were recorded on 2026-11-14 at v0.2.0. Re-run before trusting
-them for anything newer.
+Numbers below were recorded on 2026-11-14: the protocol core at v0.2.0,
+the tunnels after #68. Re-run before trusting them for anything newer.
 
 ## Protocol core
 
@@ -58,34 +58,57 @@ Colima VM on an Apple M5, 4 CPUs, Linux 6.8:
 
 ```
 == TCP, one stream
-veth               129.01 Gbit/s
-vpnd                 1.04 Gbit/s   vpnd CPU: client 78%, server 76%
-kernel wireguard     8.22 Gbit/s
+veth               121.21 Gbit/s
+vpnd                 2.37 Gbit/s   vpnd CPU: client 58%, server 60%
+kernel wireguard     8.03 Gbit/s
 == TCP, four streams
-veth               233.41 Gbit/s
-vpnd                 0.96 Gbit/s   vpnd CPU: client 79%, server 68%
-kernel wireguard     9.53 Gbit/s
+veth               212.19 Gbit/s
+vpnd                 2.48 Gbit/s   vpnd CPU: client 68%, server 68%
+kernel wireguard     9.45 Gbit/s
 ```
 
-GitHub ubuntu-latest runner, 4 vCPUs of an AMD EPYC 9V74, Linux 7.0 (azure):
+GitHub ubuntu-latest runner, 4 vCPUs of an AMD EPYC 9V45, Linux 7.0 (azure):
 
 ```
 == TCP, one stream
-veth                39.71 Gbit/s
-vpnd                 0.42 Gbit/s   vpnd CPU: client 127%, server 124%
-kernel wireguard     1.50 Gbit/s
+veth                51.74 Gbit/s
+vpnd                 3.05 Gbit/s   vpnd CPU: client 107%, server 110%
+kernel wireguard     2.31 Gbit/s
 == TCP, four streams
-veth                78.58 Gbit/s
-vpnd                 0.41 Gbit/s   vpnd CPU: client 126%, server 124%
-kernel wireguard     1.48 Gbit/s
+veth               142.41 Gbit/s
+vpnd                 3.18 Gbit/s   vpnd CPU: client 108%, server 109%
+kernel wireguard     2.35 Gbit/s
 ```
 
-vpnd gets about a sixth of the crypto ceiling on the M5 (a tenth on the
-runner), and four streams don't help. That points at per-packet costs outside the crypto: every packet
-takes a TUN read and a UDP send on one side, and a UDP receive and TUN
-write on the other, each a syscall with a copy. Kernel WireGuard pays none
-of those, hands the stack whole 64 KB segments with GSO/GRO, and spreads
-crypto over every core. Batching I/O is #68, and it should be profiled
-before it's built.
+Runners land on different CPUs from run to run, so compare within a run,
+not across them. The veth numbers are only there to show the link itself
+isn't the limit.
 
-The veth numbers are only there to show the link itself isn't the limit.
+### Batching (#68)
+
+At v0.2.0 vpnd moved one packet per syscall: 1.04 Gbit/s against kernel
+WireGuard's 8.22 on the M5 VM, and 0.42 against 1.50 on a runner. With
+`perf trace` on the receiving side, 3 s of traffic took 93.7k `recvfrom`,
+93.2k TUN `write`s, 99k `epoll_pwait`s and about 100k context switches a
+second. That's one wakeup and two or three syscalls for every packet, with
+the VM 60% idle, and crypto was only a quarter of vpnd's samples.
+
+Now, on Linux:
+
+- The TUN device runs with offload (IFF_VNET_HDR). The kernel hands vpnd
+  whole 64 KB TCP segments, which tun-rs splits into MTU-sized packets.
+- Encrypted packets to one peer leave in one `sendmsg` with UDP_SEGMENT
+  (GSO), up to 44 full-size datagrams per call.
+- UDP_GRO on receive hands back up to 44 datagrams per `recvmsg`.
+- Decrypted packets go back to the TUN device in one batch, which tun-rs
+  merges into large TCP segments (GRO).
+
+Same 3 s on the receiving side afterwards: 22.8k `recvmsg`, 20.4k TUN
+writes, about 23 packets per syscall. Crypto (ChaCha20 plus Poly1305) is
+now about 70% of vpnd's CPU time, so the next limit is one core's worth of
+crypto (#70).
+
+One trap: tun-rs only merges segments into a buffer that already has room
+for the result, and never reallocates. With buffers sized to one packet,
+nothing merged and every TUN write stayed 1430 bytes. Buffers now reserve
+64 KB.
