@@ -43,7 +43,22 @@ pub async fn up(
         peers = config.peers.len(),
         "tunnel up"
     );
-    event_loop::run(device, &tun, &udp, mtu, shutdown).await?;
+    let metrics = match iface.metrics {
+        Some(addr) => {
+            if !addr.ip().is_loopback() {
+                tracing::warn!(%addr, "metrics are not on loopback; they expose peer keys and endpoints");
+            }
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding metrics on {addr}"))?;
+            let (tx, rx) = tokio::sync::watch::channel(String::new());
+            tokio::spawn(crate::metrics::serve(listener, rx));
+            tracing::info!(%addr, "serving metrics at /metrics");
+            Some(tx)
+        }
+        None => None,
+    };
+    event_loop::run(device, &tun, &udp, mtu, metrics, shutdown).await?;
     // Dropping the TUN fd removes the interface and its routes.
     tracing::info!(interface = tun.name(), "tunnel down");
     Ok(())
