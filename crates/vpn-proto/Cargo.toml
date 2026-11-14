@@ -10,5 +10,8 @@ workspace = true
 
 [dependencies]
 base64 = "0.23.1"
+getrandom = "0.4.3"
+ipnet = "2.12.2"
 snow = "0.10.0"
 thiserror = "2.0.21"
+tracing = "0.1.44"
