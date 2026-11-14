@@ -70,9 +70,11 @@ pub async fn up(
     };
     // Everything privileged is open; nothing after this needs privilege.
     // Tearing the interface down on exit only needs the fd closed.
+    let dns = crate::dns::apply(&iface.dns, tun.name())?;
     crate::privdrop::drop_privileges(user)?;
     let result = event_loop::run(device, &tun, &udp, mtu, metrics, shutdown).await;
     installed.remove();
+    dns.remove();
     result?;
     // Dropping the TUN fd removes the interface and its routes.
     tracing::info!(interface = tun.name(), "tunnel down");

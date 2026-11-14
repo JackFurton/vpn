@@ -34,6 +34,7 @@ run_client() {
 [interface]
 private_key = "$c_priv"
 addresses = ["10.8.0.2/24"]
+${2:-}
 
 [[peer]]
 public_key = "$e_pub"
@@ -71,6 +72,18 @@ if [ "$(uname)" = Darwin ]; then
   ! route -n get 192.0.2.1 2>/dev/null | grep -q "interface: $IFACE"
 else
   ! ip route get 192.0.2.1 2>/dev/null | grep -q "dev $IFACE"
+fi
+
+# Linux DNS goes through systemd-resolved, which tests/systemd.sh covers.
+if [ "$(uname)" = Darwin ]; then
+  echo "== DNS through the tunnel"
+  # A fresh name each run, so nothing answers from cache.
+  probe="probe-$$-$RANDOM.vpnd.test"
+  run_client '"10.8.0.0/24"' 'dns = ["10.8.0.1"]'
+  dscacheutil -q host -a name "$probe" | tee "$WORK/dns.out"
+  grep -q "192.0.2.53" "$WORK/dns.out"
+  stop_client
+  echo "show State:/Network/Service/vpnd-$IFACE/DNS" | scutil | grep -q "No such key"
 fi
 
 echo "PASS"
