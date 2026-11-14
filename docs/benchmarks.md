@@ -23,7 +23,7 @@ and replay window. `device` is a whole trip through two `Device`s: route
 lookup, encrypt, parse, decrypt, cryptokey routing check, and out to the
 other side's TUN. `handshake` is both sides of a Noise IK handshake.
 
-| bench | Apple M5 | GitHub runner (x86_64) |
+| bench | Apple M5 | GitHub runner (AMD EPYC 9V74) |
 |---|---|---|
 | session/encrypt/64 | 373 ns | 1.77 us |
 | session/decrypt/64 | 360 ns | 1.75 us |
@@ -67,7 +67,7 @@ vpnd                 0.96 Gbit/s   vpnd CPU: client 79%, server 68%
 kernel wireguard     9.53 Gbit/s
 ```
 
-GitHub ubuntu-latest runner, 4 CPUs, Linux 7.0 (azure):
+GitHub ubuntu-latest runner, 4 vCPUs of an AMD EPYC 9V74, Linux 7.0 (azure):
 
 ```
 == TCP, one stream
