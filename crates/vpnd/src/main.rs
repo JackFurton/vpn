@@ -14,8 +14,17 @@ use vpnd::tun::Tun;
 #[derive(Parser)]
 #[command(version, about = "VPN daemon")]
 struct Cli {
+    /// Log as plain text or one JSON object per line
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -47,15 +56,18 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
+    let cli = Cli::parse();
+    let logs = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+        .with_writer(std::io::stderr);
+    match cli.log_format {
+        LogFormat::Text => logs.with_ansi(std::io::stderr().is_terminal()).init(),
+        LogFormat::Json => logs.json().init(),
+    }
 
-    match Cli::parse().command {
+    match cli.command {
         Command::Keygen => {
             let kp = KeyPair::generate()?;
             println!("private: {}", kp.private.to_base64());

@@ -19,8 +19,8 @@ use crate::keys::{PrivateKey, PublicKey};
 use crate::ratelimit::{COOKIE_REPLIES_PER_SEC, COOKIE_REPLY_BURST, GlobalLimiter, SourceLimiter};
 use crate::session::{Session, TransportError};
 use crate::wire::{
-    COOKIE_REPLY_LEN, CookieReply, DATA_MIN_LEN, Data, HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN,
-    HandshakeInit, HandshakeResponse, Message, TAG_LEN,
+    COOKIE_REPLY_LEN, CookieReply, DATA_HEADER_LEN, DATA_MIN_LEN, Data, HANDSHAKE_INIT_LEN,
+    HANDSHAKE_RESPONSE_LEN, HandshakeInit, HandshakeResponse, Message, TAG_LEN,
 };
 
 /// Start a new handshake once a session has carried this many messages.
@@ -58,6 +58,120 @@ const _: () = assert!(
     REKEY_ON_RECEIVE_AGE.as_secs()
         == REJECT_AFTER_TIME.as_secs() - KEEPALIVE_TIMEOUT.as_secs() - REKEY_TIMEOUT.as_secs()
 );
+
+/// Why a packet or message was discarded. Exposed as metrics labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    NotIp,
+    NoRoute,
+    QueueFull,
+    NoEndpoint,
+    HandshakeTimeout,
+    Malformed,
+    BadMac1,
+    CookieBudget,
+    RateLimited,
+    BadInitiation,
+    UnknownPeer,
+    StaleInitiation,
+    UnmatchedResponse,
+    BadResponse,
+    BadCookieReply,
+    UnknownSession,
+    ExpiredSession,
+    Replay,
+    AuthFailed,
+    InvalidInnerPacket,
+    SourceNotAllowed,
+}
+
+impl DropReason {
+    pub const ALL: [Self; 21] = [
+        Self::NotIp,
+        Self::NoRoute,
+        Self::QueueFull,
+        Self::NoEndpoint,
+        Self::HandshakeTimeout,
+        Self::Malformed,
+        Self::BadMac1,
+        Self::CookieBudget,
+        Self::RateLimited,
+        Self::BadInitiation,
+        Self::UnknownPeer,
+        Self::StaleInitiation,
+        Self::UnmatchedResponse,
+        Self::BadResponse,
+        Self::BadCookieReply,
+        Self::UnknownSession,
+        Self::ExpiredSession,
+        Self::Replay,
+        Self::AuthFailed,
+        Self::InvalidInnerPacket,
+        Self::SourceNotAllowed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotIp => "not_ip",
+            Self::NoRoute => "no_route",
+            Self::QueueFull => "queue_full",
+            Self::NoEndpoint => "no_endpoint",
+            Self::HandshakeTimeout => "handshake_timeout",
+            Self::Malformed => "malformed",
+            Self::BadMac1 => "bad_mac1",
+            Self::CookieBudget => "cookie_budget",
+            Self::RateLimited => "rate_limited",
+            Self::BadInitiation => "bad_initiation",
+            Self::UnknownPeer => "unknown_peer",
+            Self::StaleInitiation => "stale_initiation",
+            Self::UnmatchedResponse => "unmatched_response",
+            Self::BadResponse => "bad_response",
+            Self::BadCookieReply => "bad_cookie_reply",
+            Self::UnknownSession => "unknown_session",
+            Self::ExpiredSession => "expired_session",
+            Self::Replay => "replay",
+            Self::AuthFailed => "auth_failed",
+            Self::InvalidInnerPacket => "invalid_inner_packet",
+            Self::SourceNotAllowed => "source_not_allowed",
+        }
+    }
+}
+
+#[derive(Default)]
+struct Drops([u64; DropReason::ALL.len()]);
+
+impl Drops {
+    fn add(&mut self, r: DropReason, n: usize) {
+        self.0[r as usize] += n as u64;
+    }
+}
+
+/// Transport traffic with one peer. Bytes are UDP payload on the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerCounters {
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub handshakes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerStats {
+    pub public_key: PublicKey,
+    pub endpoint: Option<SocketAddr>,
+    pub counters: PeerCounters,
+    pub since_handshake: Option<Duration>,
+    pub has_session: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Stats {
+    pub peers: Vec<PeerStats>,
+    pub drops: Vec<(DropReason, u64)>,
+    pub cookie_replies_sent: u64,
+    pub under_load: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dest {
@@ -188,6 +302,8 @@ struct Peer {
     keys: MacKeys,
     /// Cookie the peer gave us while under load, and when.
     cookie: Option<(Cookie, Instant)>,
+    counters: PeerCounters,
+    last_handshake: Option<Instant>,
 }
 
 impl Peer {
@@ -245,6 +361,8 @@ pub struct Device {
     pub(crate) load_threshold: u32,
     source_limit: SourceLimiter,
     cookie_limit: GlobalLimiter,
+    drops: Drops,
+    cookie_replies_sent: u64,
 }
 
 impl Device {
@@ -260,6 +378,8 @@ impl Device {
             load_threshold: UNDER_LOAD_INITS_PER_SEC,
             source_limit: SourceLimiter::default(),
             cookie_limit: GlobalLimiter::new(COOKIE_REPLIES_PER_SEC, COOKIE_REPLY_BURST),
+            drops: Drops::default(),
+            cookie_replies_sent: 0,
         }
     }
 
@@ -267,6 +387,8 @@ impl Device {
         self.peers.push(Peer {
             keys: MacKeys::new(&c.public_key),
             cookie: None,
+            counters: PeerCounters::default(),
+            last_handshake: None,
             public_key: c.public_key,
             endpoint: c.endpoint,
             allowed_ips: c.allowed_ips,
@@ -283,16 +405,40 @@ impl Device {
         });
     }
 
+    pub fn stats(&self, now: Instant) -> Stats {
+        Stats {
+            peers: self
+                .peers
+                .iter()
+                .map(|p| PeerStats {
+                    public_key: p.public_key.clone(),
+                    endpoint: p.endpoint,
+                    counters: p.counters,
+                    since_handshake: p.last_handshake.map(|t| now.saturating_duration_since(t)),
+                    has_session: p.current.as_ref().is_some_and(|s| !s.expired(now)),
+                })
+                .collect(),
+            drops: DropReason::ALL
+                .iter()
+                .map(|&r| (r, self.drops.0[r as usize]))
+                .collect(),
+            cookie_replies_sent: self.cookie_replies_sent,
+            under_load: self.under_load_until.is_some_and(|t| now < t),
+        }
+    }
+
     /// An outbound IP packet the kernel routed into the tunnel.
     pub fn handle_tun(&mut self, packet: &[u8], now: Instant, out: &mut Outbox) {
         let Some(h) = IpHeader::parse(packet) else {
             debug!(len = packet.len(), "dropping non-IP packet from TUN");
+            self.drops.add(DropReason::NotIp, 1);
             return;
         };
         // The kernel sends its own traffic (IPv6 router solicitations, for
         // one) into any interface that's up, so this is routine.
         let Some(i) = self.route(h.dst) else {
             trace!(dst = %h.dst, "no peer for destination");
+            self.drops.add(DropReason::NoRoute, 1);
             return;
         };
         self.send_or_queue(i, packet, now, out);
@@ -312,15 +458,18 @@ impl Device {
                 if !self.keys.verify_mac1(datagram) =>
             {
                 trace!(%from, "dropping handshake message with bad mac1");
+                self.drops.add(DropReason::BadMac1, 1);
             }
             Ok(Message::HandshakeInit(m)) => {
                 if self.under_load(now) {
                     if !self.jar(now).verify_mac2(datagram, from, now) {
                         if !self.cookie_limit.allow(now) {
                             trace!(%from, "cookie reply budget spent, dropping");
+                            self.drops.add(DropReason::CookieBudget, 1);
                             return;
                         }
                         debug!(%from, "under load, replying with a cookie");
+                        self.cookie_replies_sent += 1;
                         let jar = self.jar.as_mut().expect("created above");
                         let _ = out.push(Dest::Udp(from), COOKIE_REPLY_LEN, |b| {
                             let b = b.try_into().expect("push reserved exactly this many bytes");
@@ -332,6 +481,7 @@ impl Device {
                     // mac2 proved `from` is real, so limiting by it is fair.
                     if !self.source_limit.allow(from.ip(), now) {
                         debug!(%from, "rate limiting handshakes from this source");
+                        self.drops.add(DropReason::RateLimited, 1);
                         return;
                     }
                 }
@@ -340,7 +490,10 @@ impl Device {
             Ok(Message::HandshakeResponse(m)) => self.on_response(&m, from, now, out),
             Ok(Message::CookieReply(c)) => self.on_cookie_reply(&c, now),
             Ok(Message::Data(d)) => self.on_data(&d, from, now, out),
-            Err(e) => trace!(%from, %e, "dropping datagram"),
+            Err(e) => {
+                trace!(%from, %e, "dropping datagram");
+                self.drops.add(DropReason::Malformed, 1);
+            }
         }
     }
 
@@ -359,6 +512,8 @@ impl Device {
             if let Some(a) = &peer.attempt {
                 if now.saturating_duration_since(a.first_sent) >= REKEY_ATTEMPT_TIME {
                     debug!(peer = ?peer.public_key, dropped = peer.queue.len(), "handshake timed out");
+                    self.drops
+                        .add(DropReason::HandshakeTimeout, peer.queue.len());
                     peer.attempt = None;
                     peer.queue.clear();
                 } else if now.saturating_duration_since(a.last_sent) >= REKEY_TIMEOUT {
@@ -423,7 +578,9 @@ impl Device {
         if let (Some(slot), Some(ep)) = (usable, peer.endpoint) {
             let max = Session::encrypted_len(packet.len(), mtu);
             match out.push(Dest::Udp(ep), max, |b| slot.session.encrypt(packet, mtu, b)) {
-                Ok(_) => {
+                Ok(sent) => {
+                    peer.counters.tx_bytes += sent.len() as u64;
+                    peer.counters.tx_packets += 1;
                     let rekey = (slot.we_initiated && slot.age(now) >= REKEY_AFTER_TIME)
                         || slot.session.send_counter >= REKEY_AFTER_MESSAGES;
                     peer.mark_sent(now, true);
@@ -443,6 +600,7 @@ impl Device {
             peer.queue.push_back(packet.to_vec());
         } else {
             debug!(peer = ?peer.public_key, "handshake queue full, dropping packet");
+            self.drops.add(DropReason::QueueFull, 1);
         }
         if peer.attempt.is_none() {
             self.initiate(i, now, out);
@@ -460,16 +618,24 @@ impl Device {
                 .push(Dest::Udp(ep), DATA_MIN_LEN, |b| slot.session.keepalive(b))
                 .is_ok()
         {
+            peer.counters.tx_bytes += DATA_MIN_LEN as u64;
+            peer.counters.tx_packets += 1;
             peer.mark_sent(now, false);
         }
     }
 
     fn initiate(&mut self, i: usize, now: Instant, out: &mut Outbox) {
         let index = self.fresh_index();
-        let Self { private, peers, .. } = self;
+        let Self {
+            private,
+            peers,
+            drops,
+            ..
+        } = self;
         let peer = &mut peers[i];
         let Some(ep) = peer.endpoint else {
             debug!(peer = ?peer.public_key, "no endpoint known, can't start handshake");
+            drops.add(DropReason::NoEndpoint, peer.queue.len());
             peer.queue.clear();
             return;
         };
@@ -533,6 +699,7 @@ impl Device {
                 .is_some_and(|x| x.sender_index() == c.receiver_index)
         }) else {
             trace!("cookie reply for no pending handshake");
+            self.drops.add(DropReason::BadCookieReply, 1);
             return;
         };
         let sent_mac1 = peer.attempt.as_ref().expect("found above").sent_mac1;
@@ -540,7 +707,10 @@ impl Device {
             // Don't resend now: the retry timer does, so a flood of cookie
             // replies can't make us flood initiations.
             Some(cookie) => peer.cookie = Some((cookie, now)),
-            None => debug!(peer = ?peer.public_key, "dropping cookie reply that didn't open"),
+            None => {
+                debug!(peer = ?peer.public_key, "dropping cookie reply that didn't open");
+                self.drops.add(DropReason::BadCookieReply, 1);
+            }
         }
     }
 
@@ -565,6 +735,7 @@ impl Device {
             Ok(r) => r,
             Err(e) => {
                 debug!(%from, %e, "dropping initiation");
+                self.drops.add(DropReason::BadInitiation, 1);
                 return;
             }
         };
@@ -574,6 +745,7 @@ impl Device {
             .position(|p| &p.public_key == received.peer())
         else {
             debug!(%from, peer = ?received.peer(), "initiation from unknown key");
+            self.drops.add(DropReason::UnknownPeer, 1);
             return;
         };
         let index = self.fresh_index();
@@ -592,7 +764,10 @@ impl Device {
                 });
                 peer.mark_received(now, false);
             }
-            Err(e) => debug!(%from, %e, "rejecting initiation"),
+            Err(e) => {
+                debug!(%from, %e, "rejecting initiation");
+                self.drops.add(DropReason::StaleInitiation, 1);
+            }
         }
     }
 
@@ -610,6 +785,7 @@ impl Device {
                 .is_some_and(|x| x.sender_index() == m.receiver_index)
         }) else {
             trace!(%from, "response for no pending handshake");
+            self.drops.add(DropReason::UnmatchedResponse, 1);
             return;
         };
         let peer = &mut self.peers[i];
@@ -618,6 +794,8 @@ impl Device {
         match initiator.finish(m) {
             Ok(session) => {
                 peer.attempt = None;
+                peer.counters.handshakes += 1;
+                peer.last_handshake = Some(now);
                 peer.promote(Slot {
                     session,
                     born: now,
@@ -629,7 +807,10 @@ impl Device {
             }
             // The index is visible on the wire, so anyone can send a bogus
             // response. Leave the attempt in place for `tick` to retry.
-            Err(e) => debug!(%from, %e, "dropping response"),
+            Err(e) => {
+                debug!(%from, %e, "dropping response");
+                self.drops.add(DropReason::BadResponse, 1);
+            }
         }
     }
 
@@ -641,12 +822,14 @@ impl Device {
             .find_map(|(i, p)| p.find(d.receiver_index).map(|w| (i, w)))
         else {
             trace!(index = d.receiver_index, "data for unknown session");
+            self.drops.add(DropReason::UnknownSession, 1);
             return;
         };
         let peer = &mut self.peers[i];
         let slot = peer.slot(which).as_mut().expect("found above");
         if slot.expired(now) {
             trace!("data for expired session");
+            self.drops.add(DropReason::ExpiredSession, 1);
             return;
         }
         let rekey_on_receive = matches!(which, Which::Current)
@@ -660,15 +843,26 @@ impl Device {
             Ok(p) => p,
             Err(e) => {
                 trace!(%e, "dropping data");
+                self.drops.add(
+                    match e {
+                        TransportError::Replay => DropReason::Replay,
+                        TransportError::InvalidInnerPacket => DropReason::InvalidInnerPacket,
+                        _ => DropReason::AuthFailed,
+                    },
+                    1,
+                );
                 return;
             }
         };
+        peer.counters.rx_bytes += (DATA_HEADER_LEN + d.ciphertext.len()) as u64;
+        peer.counters.rx_packets += 1;
         let is_data = !packet.is_empty();
         let allowed = IpHeader::parse(packet)
             .is_some_and(|h| peer.allowed_ips.iter().any(|n| n.contains(&h.src)));
         if !is_data || !allowed {
             if is_data {
                 debug!(peer = ?peer.public_key, "dropping packet from a source outside allowed_ips");
+                self.drops.add(DropReason::SourceNotAllowed, 1);
             }
             out.pop();
         }
@@ -683,6 +877,8 @@ impl Device {
 
         if matches!(which, Which::Next) {
             let slot = peer.next.take().expect("found above");
+            peer.counters.handshakes += 1;
+            peer.last_handshake = Some(now);
             peer.promote(slot);
             self.flush(i, false, now, out);
         } else if rekey_on_receive && peer.attempt.is_none() {
@@ -1265,5 +1461,42 @@ mod tests {
             responses += reply.iter().filter(|(_, b)| b[0] == 2).count();
         }
         assert_eq!(responses, crate::ratelimit::HANDSHAKE_BURST as usize);
+    }
+
+    fn drops(d: &Device, r: DropReason) -> u64 {
+        d.drops.0[r as usize]
+    }
+
+    #[test]
+    fn counts_traffic_handshakes_and_drops() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        net.send_b(&to_a(2));
+        let a = net.a.stats(net.now);
+        let p = &a.peers[0];
+        assert!(p.has_session);
+        assert_eq!(p.since_handshake, Some(Duration::ZERO));
+        assert_eq!(p.counters.handshakes, 1);
+        assert_eq!((p.counters.tx_packets, p.counters.rx_packets), (1, 1));
+        // 28-byte packet padded to 32, plus 16 header and 16 tag.
+        assert_eq!((p.counters.tx_bytes, p.counters.rx_bytes), (64, 64));
+        let b = net.b.stats(net.now);
+        assert_eq!(
+            b.peers[0].counters.handshakes, 1,
+            "responder counts on promotion"
+        );
+
+        net.send_a(&ipv4([10, 0, 0, 1], [8, 8, 8, 8], 0));
+        net.send_a(&ipv4([10, 0, 0, 99], [10, 0, 0, 2], 0));
+        net.b.handle_udp(&[9, 9, 9], A, net.now, &mut Outbox::new());
+        assert_eq!(drops(&net.a, DropReason::NoRoute), 1);
+        assert_eq!(drops(&net.b, DropReason::SourceNotAllowed), 1);
+        assert_eq!(drops(&net.b, DropReason::Malformed), 1);
+
+        net.now += Duration::from_secs(7);
+        assert_eq!(
+            net.a.stats(net.now).peers[0].since_handshake,
+            Some(Duration::from_secs(7))
+        );
     }
 }

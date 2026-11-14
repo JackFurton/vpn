@@ -31,6 +31,8 @@ pub struct Interface {
     pub listen_port: Option<u16>,
     pub addresses: Vec<IpNet>,
     pub mtu: u16,
+    /// Where to serve Prometheus metrics, if anywhere.
+    pub metrics: Option<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -92,6 +94,7 @@ struct RawInterface {
     listen_port: Option<u16>,
     addresses: Vec<IpNet>,
     mtu: Option<u16>,
+    metrics: Option<SocketAddr>,
 }
 
 #[derive(Deserialize)]
@@ -188,6 +191,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
             listen_port: i.listen_port,
             addresses: i.addresses,
             mtu,
+            metrics: i.metrics,
         },
         peers,
     })

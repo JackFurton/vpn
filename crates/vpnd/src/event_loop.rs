@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io;
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use vpn_proto::device::{Dest, Device, Outbox};
 
@@ -14,6 +15,8 @@ use crate::udp::Udp;
 /// Retries are on a 5s scale; 250ms keeps them within a tick of on time.
 const TICK: Duration = Duration::from_millis(250);
 const MAX_DATAGRAM: usize = 65_535;
+/// Rendering is cheap, but a scrape never needs fresher numbers than this.
+const METRICS_EVERY: Duration = Duration::from_secs(1);
 
 /// Packet IO the loop needs from a TUN device. A trait so tests can use
 /// channels instead of a real interface, which needs root.
@@ -38,8 +41,10 @@ pub async fn run(
     tun: &impl PacketDevice,
     udp: &Udp,
     mtu: usize,
+    metrics: Option<watch::Sender<String>>,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    let mut last_publish: Option<Instant> = None;
     let mut tun_buf = vec![0; mtu];
     let mut udp_buf = vec![0; MAX_DATAGRAM];
     let mut out = Outbox::new();
@@ -61,7 +66,16 @@ pub async fn run(
                 // They say nothing about this socket's health.
                 Err(e) => tracing::debug!(%e, "UDP receive error"),
             },
-            _ = ticker.tick() => device.tick(Instant::now(), &mut out),
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                device.tick(now, &mut out);
+                if let Some(tx) = &metrics
+                    && last_publish.is_none_or(|t| now - t >= METRICS_EVERY)
+                {
+                    tx.send_replace(crate::metrics::render(&device.stats(now)));
+                    last_publish = Some(now);
+                }
+            }
             () = &mut shutdown => return Ok(()),
         }
 
@@ -132,7 +146,7 @@ mod tests {
                 from_kernel: Mutex::new(from_kernel),
                 to_kernel,
             };
-            run(device, &tun, &udp, 1420, async {
+            run(device, &tun, &udp, 1420, None, async {
                 let _ = stopped.await;
             })
             .await
