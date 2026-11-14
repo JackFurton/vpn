@@ -1,0 +1,13 @@
+name: Feature
+description: New capability or improvement
+labels: [type/feature]
+body:
+  - type: textarea
+    attributes:
+      label: What and why
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Done when
+      description: Acceptance criteria.
