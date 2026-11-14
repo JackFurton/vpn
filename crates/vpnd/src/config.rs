@@ -68,12 +68,11 @@ pub enum ConfigError {
     DuplicatePeer { first: usize, second: usize },
     #[error("peer {index}: allowed_ips {net} has host bits set, did you mean {}?", net.trunc())]
     HostBits { index: usize, net: IpNet },
-    #[error("peer {first} allowed_ips {a} overlaps peer {second} allowed_ips {b}")]
-    Overlap {
+    #[error("peers {first} and {second} both claim allowed_ips {net}")]
+    DuplicateRoute {
         first: usize,
-        a: IpNet,
         second: usize,
-        b: IpNet,
+        net: IpNet,
     },
     #[error("peer {index}: persistent_keepalive 0 isn't valid, leave it out to disable")]
     ZeroKeepalive { index: usize },
@@ -163,18 +162,16 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         if let Some(&net) = p.allowed_ips.iter().find(|n| **n != n.trunc()) {
             return Err(ConfigError::HostBits { index, net });
         }
-        // Overlap would make routing depend on lookup order. Within one peer
-        // it's harmless, so only compare against earlier peers.
+        // Nested prefixes across peers are fine: the longest match wins, so
+        // one peer can be the default route while another owns a /32. The
+        // same prefix on two peers has no winner.
         for (first, q) in peers.iter().enumerate() {
-            for &a in &q.allowed_ips {
-                if let Some(&b) = p.allowed_ips.iter().find(|b| overlaps(a, **b)) {
-                    return Err(ConfigError::Overlap {
-                        first,
-                        a,
-                        second: index,
-                        b,
-                    });
-                }
+            if let Some(&net) = p.allowed_ips.iter().find(|n| q.allowed_ips.contains(n)) {
+                return Err(ConfigError::DuplicateRoute {
+                    first,
+                    second: index,
+                    net,
+                });
             }
         }
         peers.push(Peer {
@@ -195,10 +192,6 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
         },
         peers,
     })
-}
-
-fn overlaps(a: IpNet, b: IpNet) -> bool {
-    a.contains(&b.network()) || b.contains(&a.network())
 }
 
 #[cfg(unix)]
@@ -324,22 +317,23 @@ mod tests {
     }
 
     #[test]
-    fn overlap_across_peers_only() {
-        let same_peer = peer("\"10.0.0.0/8\", \"10.1.0.0/16\"");
-        assert!(Config::parse(&config(&same_peer)).is_ok());
+    fn nested_routes_ok_duplicates_not() {
+        let nested = config(&format!(
+            "{}{}",
+            peer("\"0.0.0.0/0\""),
+            peer("\"10.8.0.2/32\"")
+        ));
+        assert!(Config::parse(&nested).is_ok());
 
         let text = config(&format!(
             "{}{}",
             peer("\"10.0.0.0/8\""),
-            peer("\"192.168.0.0/16\", \"10.1.0.0/16\"")
+            peer("\"192.168.0.0/16\", \"10.0.0.0/8\"")
         ));
         assert_eq!(
             err(&text),
-            "peer 0 allowed_ips 10.0.0.0/8 overlaps peer 1 allowed_ips 10.1.0.0/16"
+            "peers 0 and 1 both claim allowed_ips 10.0.0.0/8"
         );
-
-        let v4_and_v6 = config(&format!("{}{}", peer("\"0.0.0.0/0\""), peer("\"::/0\"")));
-        assert!(Config::parse(&v4_and_v6).is_ok());
     }
 
     #[test]
