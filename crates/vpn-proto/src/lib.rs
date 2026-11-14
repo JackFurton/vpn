@@ -1,6 +1,7 @@
 //! Sans-IO protocol core: wire format, handshake and transport state.
 //! Nothing in this crate touches sockets or TUN devices.
 
+pub mod device;
 pub mod handshake;
 pub mod ip;
 pub mod keys;
