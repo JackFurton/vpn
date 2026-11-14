@@ -30,8 +30,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-      # A short smoke run on PRs, a longer one nightly.
-      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && 300 || 30 }}
+      # install-action ships a musl-built cargo-fuzz, which defaults to the musl
+      # target, where ASan can't run. A short smoke run on PRs, longer nightly.
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && 300 || 30 }}
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
