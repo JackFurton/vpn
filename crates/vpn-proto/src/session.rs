@@ -1,7 +1,10 @@
 //! An established session: encrypts outgoing IP packets into data messages and
 //! authenticates incoming ones, in the order docs/protocol.md requires.
 
-use snow::StatelessTransportState;
+use chacha20poly1305::aead::inout::InOutBuf;
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
+use zeroize::Zeroizing;
 
 use crate::replay::{REJECT_AFTER_MESSAGES, ReplayWindow};
 use crate::wire::{BufferTooSmall, DATA_HEADER_LEN, Data, TAG_LEN, encode_data_header};
@@ -43,30 +46,40 @@ pub struct Session {
     pub local_index: u32,
     /// Index the peer chose. We address packets to them with it.
     pub remote_index: u32,
-    pub(crate) transport: StatelessTransportState,
+    // Both wipe their keys on drop (chacha20poly1305's `zeroize` feature).
+    send: ChaCha20Poly1305,
+    recv: ChaCha20Poly1305,
     pub(crate) send_counter: u64,
     replay: ReplayWindow,
     confirmed: bool,
-    pad_buf: Vec<u8>,
+}
+
+/// Transport keys from the end of a handshake, from our point of view.
+pub(crate) struct Keys {
+    pub send: Zeroizing<[u8; 32]>,
+    pub recv: Zeroizing<[u8; 32]>,
+}
+
+/// Same layout snow uses, which keeps the wire format unchanged: 4 zero
+/// bytes, then the counter little-endian.
+fn nonce(counter: u64) -> Nonce {
+    let mut n = [0u8; 12];
+    n[4..].copy_from_slice(&counter.to_le_bytes());
+    Nonce::from(n)
 }
 
 impl Session {
-    pub(crate) fn new(
-        local_index: u32,
-        remote_index: u32,
-        transport: StatelessTransportState,
-        role: Role,
-    ) -> Self {
+    pub(crate) fn new(local_index: u32, remote_index: u32, keys: Keys, role: Role) -> Self {
         Self {
             local_index,
             remote_index,
-            transport,
+            send: ChaCha20Poly1305::new_from_slice(&*keys.send).expect("32-byte key"),
+            recv: ChaCha20Poly1305::new_from_slice(&*keys.recv).expect("32-byte key"),
             send_counter: 0,
             replay: ReplayWindow::new(),
             // The responder can't know the initiator derived the same keys
             // until a packet from it decrypts.
             confirmed: role == Role::Initiator,
-            pad_buf: Vec::new(),
         }
     }
 
@@ -110,18 +123,16 @@ impl Session {
             .expect("len includes the header");
         encode_data_header(self.remote_index, counter, header);
 
-        let padded = padded_len(packet.len(), mtu);
-        let plaintext = if padded == packet.len() {
-            packet
-        } else {
-            self.pad_buf.clear();
-            self.pad_buf.extend_from_slice(packet);
-            self.pad_buf.resize(padded, 0);
-            &self.pad_buf
-        };
-        self.transport
-            .write_message(counter, plaintext, body)
+        // Encrypt in place: the padded plaintext goes where the ciphertext
+        // will be, so the packet is copied exactly once.
+        let (body, tag_out) = body.split_at_mut(padded_len(packet.len(), mtu));
+        body[..packet.len()].copy_from_slice(packet);
+        body[packet.len()..].fill(0);
+        let tag = self
+            .send
+            .encrypt_inout_detached(&nonce(counter), &[], body.into())
             .map_err(|_| TransportError::Encrypt)?;
+        tag_out.copy_from_slice(&tag);
         self.send_counter += 1;
         Ok(len)
     }
@@ -147,11 +158,15 @@ impl Session {
             return Err(TransportError::Replay);
         }
 
-        let need = msg.ciphertext.len() - TAG_LEN;
+        let (ciphertext, tag) = msg.ciphertext.split_at(msg.ciphertext.len() - TAG_LEN);
+        let tag: [u8; TAG_LEN] = tag.try_into().expect("split at TAG_LEN");
+        let need = ciphertext.len();
         let got = out.len();
         let out = out.get_mut(..need).ok_or(BufferTooSmall { need, got })?;
-        self.transport
-            .read_message(msg.counter, msg.ciphertext, out)
+        // Decrypts straight from the datagram into `out`, no copy first.
+        let buf = InOutBuf::new(ciphertext, out).expect("same length");
+        self.recv
+            .decrypt_inout_detached(&nonce(msg.counter), &[], buf, &Tag::from(tag))
             .map_err(|_| TransportError::Decrypt)?;
 
         // Only now is the counter trustworthy enough to move the window.
