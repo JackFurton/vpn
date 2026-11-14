@@ -16,6 +16,7 @@ use crate::cookie::{COOKIE_USE_LIFETIME, Cookie, CookieJar, MacKeys};
 use crate::handshake::{HandshakeError, InitReceived, Initiator, Tai64N, read_init};
 use crate::ip::IpHeader;
 use crate::keys::{PrivateKey, PublicKey};
+use crate::ratelimit::{COOKIE_REPLIES_PER_SEC, COOKIE_REPLY_BURST, GlobalLimiter, SourceLimiter};
 use crate::session::{Session, TransportError};
 use crate::wire::{
     COOKIE_REPLY_LEN, CookieReply, DATA_MIN_LEN, Data, HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN,
@@ -242,6 +243,8 @@ pub struct Device {
     load_window: Option<(Instant, u32)>,
     under_load_until: Option<Instant>,
     pub(crate) load_threshold: u32,
+    source_limit: SourceLimiter,
+    cookie_limit: GlobalLimiter,
 }
 
 impl Device {
@@ -255,6 +258,8 @@ impl Device {
             load_window: None,
             under_load_until: None,
             load_threshold: UNDER_LOAD_INITS_PER_SEC,
+            source_limit: SourceLimiter::default(),
+            cookie_limit: GlobalLimiter::new(COOKIE_REPLIES_PER_SEC, COOKIE_REPLY_BURST),
         }
     }
 
@@ -309,15 +314,26 @@ impl Device {
                 trace!(%from, "dropping handshake message with bad mac1");
             }
             Ok(Message::HandshakeInit(m)) => {
-                if self.under_load(now) && !self.jar(now).verify_mac2(datagram, from, now) {
-                    debug!(%from, "under load, replying with a cookie");
-                    let jar = self.jar.as_mut().expect("created above");
-                    let _ = out.push(Dest::Udp(from), COOKIE_REPLY_LEN, |b| {
-                        let b = b.try_into().expect("push reserved exactly this many bytes");
-                        jar.reply(datagram, m.sender_index, from, now, b);
-                        Ok::<_, ()>(COOKIE_REPLY_LEN)
-                    });
-                    return;
+                if self.under_load(now) {
+                    if !self.jar(now).verify_mac2(datagram, from, now) {
+                        if !self.cookie_limit.allow(now) {
+                            trace!(%from, "cookie reply budget spent, dropping");
+                            return;
+                        }
+                        debug!(%from, "under load, replying with a cookie");
+                        let jar = self.jar.as_mut().expect("created above");
+                        let _ = out.push(Dest::Udp(from), COOKIE_REPLY_LEN, |b| {
+                            let b = b.try_into().expect("push reserved exactly this many bytes");
+                            jar.reply(datagram, m.sender_index, from, now, b);
+                            Ok::<_, ()>(COOKIE_REPLY_LEN)
+                        });
+                        return;
+                    }
+                    // mac2 proved `from` is real, so limiting by it is fair.
+                    if !self.source_limit.allow(from.ip(), now) {
+                        debug!(%from, "rate limiting handshakes from this source");
+                        return;
+                    }
                 }
                 self.on_init(&m, from, now, out);
             }
@@ -330,6 +346,7 @@ impl Device {
 
     /// Drives every timer. Call a few times a second.
     pub fn tick(&mut self, now: Instant, out: &mut Outbox) {
+        self.source_limit.forget_idle(now);
         for i in 0..self.peers.len() {
             let peer = &mut self.peers[i];
             for which in [Which::Current, Which::Previous, Which::Next] {
@@ -1226,5 +1243,27 @@ mod tests {
             "forged counter fails auth"
         );
         assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn rate_limits_proven_sources_under_load() {
+        let mut net = Net::new();
+        net.b.load_threshold = 0;
+        net.drop_types = vec![2];
+        net.send_a(&to_b(1));
+        assert!(net.a.peers[0].cookie.is_some());
+
+        // Ten initiations in the same instant, all carrying a valid mac2.
+        let mut responses = 0;
+        for _ in 0..10 {
+            let mut out = Outbox::new();
+            net.a.peers[0].attempt = None;
+            net.a.initiate(0, net.now, &mut out);
+            let (_, init) = out.iter().next().unwrap();
+            let mut reply = Outbox::new();
+            net.b.handle_udp(init, A, net.now, &mut reply);
+            responses += reply.iter().filter(|(_, b)| b[0] == 2).count();
+        }
+        assert_eq!(responses, crate::ratelimit::HANDSHAKE_BURST as usize);
     }
 }
