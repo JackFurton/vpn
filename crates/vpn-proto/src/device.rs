@@ -197,6 +197,42 @@ impl Outbox {
         self.items.iter().map(|(d, r)| (*d, &self.buf[r.clone()]))
     }
 
+    /// UDP datagrams grouped for segmentation offload (Linux UDP_SEGMENT):
+    /// each run is up to `max_segments` adjacent datagrams to one address,
+    /// all `segment` bytes except a possibly shorter last one, as one slice.
+    pub fn udp_runs(
+        &self,
+        max_segments: usize,
+    ) -> impl Iterator<Item = (SocketAddr, &[u8], usize)> {
+        let mut items = self.items.iter().peekable();
+        std::iter::from_fn(move || {
+            let (to, first) = loop {
+                match items.next()? {
+                    (Dest::Udp(to), r) => break (*to, r.clone()),
+                    (Dest::Tun, _) => {}
+                }
+            };
+            let segment = first.len();
+            let mut end = first.end;
+            let mut count = 1;
+            // Only the last segment may be short, so a short one ends the run.
+            let mut all_full = true;
+            while all_full && count < max_segments {
+                let Some((Dest::Udp(next_to), r)) = items.peek() else {
+                    break;
+                };
+                if *next_to != to || r.start != end || r.len() > segment {
+                    break;
+                }
+                all_full = r.len() == segment;
+                end = r.end;
+                count += 1;
+                items.next();
+            }
+            Some((to, &self.buf[first.start..end], segment))
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -1100,6 +1136,46 @@ mod tests {
                 .session
                 .local_index
         }
+    }
+
+    #[test]
+    fn udp_runs_group_what_one_gso_send_can_carry() {
+        let mut out = Outbox::new();
+        let push = |out: &mut Outbox, dest, len: usize, byte: u8| {
+            out.push(dest, len, |b| {
+                b.fill(byte);
+                Ok::<_, ()>(len)
+            })
+            .unwrap();
+        };
+        for (dest, len, byte) in [
+            (Dest::Udp(A), 100, 1),
+            (Dest::Udp(A), 100, 2),
+            (Dest::Udp(A), 60, 3), // short, so it ends the run
+            (Dest::Udp(A), 100, 4),
+            (Dest::Udp(B), 100, 5), // new address
+            (Dest::Tun, 50, 6),     // not UDP, and breaks adjacency
+            (Dest::Udp(B), 100, 7),
+            (Dest::Udp(B), 120, 8), // longer than the segment
+        ] {
+            push(&mut out, dest, len, byte);
+        }
+        let runs: Vec<_> = out
+            .udp_runs(64)
+            .map(|(to, bytes, seg)| (to, bytes.len(), seg, bytes[0], bytes[bytes.len() - 1]))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                (A, 260, 100, 1, 3),
+                (A, 100, 100, 4, 4),
+                (B, 100, 100, 5, 5),
+                (B, 100, 100, 7, 7),
+                (B, 120, 120, 8, 8),
+            ]
+        );
+        let capped: Vec<_> = out.udp_runs(2).map(|(_, b, _)| b.len()).collect();
+        assert_eq!(capped, [200, 60, 100, 100, 100, 120]);
     }
 
     #[test]
