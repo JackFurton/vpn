@@ -323,7 +323,7 @@ impl Device {
             }
             Ok(Message::HandshakeResponse(m)) => self.on_response(&m, from, now, out),
             Ok(Message::CookieReply(c)) => self.on_cookie_reply(&c, now),
-            Ok(Message::Data(d)) => self.on_data(&d, now, out),
+            Ok(Message::Data(d)) => self.on_data(&d, from, now, out),
             Err(e) => trace!(%from, %e, "dropping datagram"),
         }
     }
@@ -616,7 +616,7 @@ impl Device {
         }
     }
 
-    fn on_data(&mut self, d: &Data, now: Instant, out: &mut Outbox) {
+    fn on_data(&mut self, d: &Data, from: SocketAddr, now: Instant, out: &mut Outbox) {
         let Some((i, which)) = self
             .peers
             .iter()
@@ -656,6 +656,13 @@ impl Device {
             out.pop();
         }
         peer.mark_received(now, is_data);
+        // Roaming: the packet authenticated and passed the replay window, so
+        // the peer really is at `from` now (a laptop changing networks, a
+        // NAT rebinding). Only the first copy of a packet gets this far.
+        if peer.endpoint != Some(from) {
+            debug!(peer = ?peer.public_key, old = ?peer.endpoint, new = %from, "peer roamed");
+            peer.endpoint = Some(from);
+        }
 
         if matches!(which, Which::Next) {
             let slot = peer.next.take().expect("found above");
@@ -1167,5 +1174,57 @@ mod tests {
         assert!(net.b.under_load(t), "third in a second tips it over");
         assert!(net.b.under_load(t + Duration::from_millis(999)));
         assert!(!net.b.under_load(t + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn follows_peer_to_new_address() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        assert_eq!(net.b.peers[0].endpoint, Some(A));
+
+        let moved: SocketAddr = "198.51.100.9:3000".parse().unwrap();
+        let mut out = Outbox::new();
+        net.a.handle_tun(&to_b(2), net.now, &mut out);
+        let (_, wire) = out.iter().next().unwrap();
+        let mut at_b = Outbox::new();
+        net.b.handle_udp(wire, moved, net.now, &mut at_b);
+        assert_eq!(at_b.iter().count(), 1, "packet delivered");
+        assert_eq!(net.b.peers[0].endpoint, Some(moved));
+
+        // B now answers at the new address.
+        let mut reply = Outbox::new();
+        net.b.handle_tun(&to_a(3), net.now, &mut reply);
+        assert_eq!(reply.iter().next().unwrap().0, Dest::Udp(moved));
+    }
+
+    #[test]
+    fn forged_or_replayed_packets_do_not_move_the_endpoint() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        let attacker: SocketAddr = "203.0.113.66:6666".parse().unwrap();
+
+        let mut out = Outbox::new();
+        net.a.handle_tun(&to_b(2), net.now, &mut out);
+        let (_, wire) = out.iter().next().unwrap();
+        let wire = wire.to_vec();
+        net.pump(A, out);
+
+        let mut sink = Outbox::new();
+        net.b.handle_udp(&wire, attacker, net.now, &mut sink);
+        assert_eq!(
+            net.b.peers[0].endpoint,
+            Some(A),
+            "replay of a delivered packet"
+        );
+
+        let mut forged = wire.clone();
+        forged[8..16].copy_from_slice(&999u64.to_le_bytes());
+        net.b.handle_udp(&forged, attacker, net.now, &mut sink);
+        assert_eq!(
+            net.b.peers[0].endpoint,
+            Some(A),
+            "forged counter fails auth"
+        );
+        assert!(sink.is_empty());
     }
 }
