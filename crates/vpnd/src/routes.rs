@@ -15,8 +15,10 @@
 //! macOS has no fwmark routing, so there a default route becomes the classic
 //! split instead: 0.0.0.0/1 and 128.0.0.0/1 on the tunnel (each more specific
 //! than the real default route, which stays untouched), plus a host route
-//! for every peer endpoint via whatever reached it before. vpnd stays root on
-//! macOS and removes those on exit.
+//! for every peer endpoint via whatever reached it before. When a peer
+//! roams, its new address gets a host route through the old default route
+//! and the stale one goes. vpnd stays root on macOS and removes all of
+//! these on exit.
 //!
 //! On Linux every route points at the TUN device, so the kernel deletes them when the
 //! device goes away, which matters because vpnd drops the privilege to remove
@@ -79,7 +81,7 @@ pub fn plan(config: &Config) -> Plan {
 #[derive(Default)]
 pub struct Installed {
     #[cfg(target_os = "macos")]
-    routes: Vec<route_manager::Route>,
+    macos: macos::State,
 }
 
 #[cfg(target_os = "linux")]
@@ -90,12 +92,23 @@ pub use macos::apply;
 impl Installed {
     pub fn remove(self) {
         #[cfg(target_os = "macos")]
-        macos::remove(self.routes);
+        self.macos.remove();
+    }
+
+    /// Called when peers move. On macOS with a default route, each endpoint
+    /// needs a host route around the tunnel, or vpnd's packets to it loop
+    /// back in. Linux's fwmark already handles any address.
+    pub fn update_endpoints(&mut self, endpoints: Vec<IpAddr>) {
+        #[cfg(target_os = "macos")]
+        self.macos.update_endpoints(endpoints);
+        #[cfg(not(target_os = "macos"))]
+        let _ = endpoints;
     }
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use anyhow::{Context, Result};
@@ -103,28 +116,130 @@ mod macos {
 
     use super::{Installed, Plan};
 
-    pub async fn apply(plan: &Plan, ifname: &str) -> Result<Installed> {
-        let mut rm = RouteManager::new().context("opening routing socket")?;
-        let mut added = Vec::new();
-        let on_tunnel = |dst: IpAddr, len: u8| Route::new(dst, len).with_if_name(ifname.to_owned());
+    #[derive(Default)]
+    pub struct State {
+        ifname: String,
+        /// Tunnel routes, including the /1 pairs.
+        routes: Vec<Route>,
+        /// Whether endpoints need pinning at all (a default route is ours).
+        pinning: bool,
+        /// The default routes from before the tunnel took over, which is
+        /// where a pinned endpoint's route points once the tunnel is up and
+        /// a lookup only finds the tunnel.
+        underlay: Vec<Route>,
+        /// Endpoint host routes we added.
+        pinned: HashMap<IpAddr, Route>,
+    }
 
-        let mut wanted: Vec<Route> = Vec::new();
-        if plan.has_default() {
-            // Pin each endpoint to its current path before the /1s capture it.
-            for &ep in &plan.endpoints {
-                let current = rm
-                    .find_route(&ep)?
-                    .with_context(|| format!("no route to endpoint {ep}"))?;
-                let len = if ep.is_ipv4() { 32 } else { 128 };
-                let mut host = Route::new(ep, len);
-                host = match (current.gateway(), current.if_name()) {
-                    (Some(gw), _) if !gw.is_unspecified() => host.with_gateway(gw),
-                    (_, Some(name)) => host.with_if_name(name.clone()),
-                    _ => continue,
+    fn host_route(ep: IpAddr, via: &Route) -> Option<Route> {
+        let host = Route::new(ep, if ep.is_ipv4() { 32 } else { 128 });
+        match (via.gateway(), via.if_name()) {
+            (Some(gw), _) if !gw.is_unspecified() => Some(host.with_gateway(gw)),
+            (_, Some(name)) => Some(host.with_if_name(name.clone())),
+            _ => None,
+        }
+    }
+
+    impl State {
+        /// Adds a host route for `ep` if the tunnel would otherwise capture
+        /// it. Before the tunnel routes exist, that's anything not already
+        /// on a host route; after, anything whose lookup lands on the tunnel.
+        fn pin(&mut self, rm: &mut RouteManager, ep: IpAddr, tunnel_up: bool) {
+            let current = match rm.find_route(&ep) {
+                Ok(Some(r)) => r,
+                Ok(None) => return tracing::warn!(%ep, "no route to endpoint"),
+                Err(e) => return tracing::warn!(%ep, %e, "looking up route to endpoint"),
+            };
+            let via = if current.if_name() == Some(&self.ifname) {
+                let Some(d) = self
+                    .underlay
+                    .iter()
+                    .find(|d| d.destination().is_ipv4() == ep.is_ipv4())
+                else {
+                    return tracing::warn!(%ep, "endpoint routed into the tunnel and no default route to send it by instead");
                 };
-                wanted.push(host);
+                d.clone()
+            } else if tunnel_up || current.prefix() == if ep.is_ipv4() { 32 } else { 128 } {
+                // More specific than anything the tunnel adds already.
+                return;
+            } else {
+                current
+            };
+            let Some(route) = host_route(ep, &via) else {
+                return;
+            };
+            match rm.add(&route) {
+                Ok(()) => {
+                    tracing::info!(%ep, gateway = ?route.gateway(), interface = ?route.if_name(), "endpoint route added");
+                    self.pinned.insert(ep, route);
+                }
+                Err(e) => tracing::warn!(%ep, %e, "couldn't add endpoint route"),
             }
         }
+
+        pub fn update_endpoints(&mut self, endpoints: Vec<IpAddr>) {
+            if !self.pinning {
+                return;
+            }
+            let mut rm = match RouteManager::new() {
+                Ok(rm) => rm,
+                Err(e) => return tracing::warn!(%e, "opening routing socket"),
+            };
+            for ep in &endpoints {
+                if !self.pinned.contains_key(ep) {
+                    self.pin(&mut rm, *ep, true);
+                }
+            }
+            self.pinned.retain(|ep, route| {
+                if endpoints.contains(ep) {
+                    return true;
+                }
+                match rm.delete(route) {
+                    Ok(()) => tracing::info!(%ep, "endpoint route removed"),
+                    Err(e) => tracing::warn!(%ep, %e, "couldn't remove endpoint route"),
+                }
+                false
+            });
+        }
+
+        pub fn remove(self) {
+            let Ok(mut rm) = RouteManager::new() else {
+                return;
+            };
+            for route in self.pinned.values().chain(self.routes.iter().rev()) {
+                // Routes on the utun device usually vanish with it already.
+                let _ = rm.delete(route);
+            }
+        }
+    }
+
+    pub async fn apply(plan: &Plan, ifname: &str) -> Result<Installed> {
+        let mut rm = RouteManager::new().context("opening routing socket")?;
+        let mut state = State {
+            ifname: ifname.to_owned(),
+            pinning: plan.has_default(),
+            ..State::default()
+        };
+        let on_tunnel = |dst: IpAddr, len: u8| Route::new(dst, len).with_if_name(ifname.to_owned());
+
+        if state.pinning {
+            for any in [
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ] {
+                if let Ok(Some(d)) = rm.find_route(&any)
+                    && d.prefix() == 0
+                {
+                    state.underlay.push(d);
+                }
+            }
+            // Pin each endpoint to its current path before the /1s capture it.
+            for &ep in &plan.endpoints {
+                state.pin(&mut rm, ep, false);
+            }
+        }
+
+        let mut wanted: Vec<Route> = Vec::new();
         if plan.default_v4 {
             wanted.push(on_tunnel(Ipv4Addr::new(0, 0, 0, 0).into(), 1));
             wanted.push(on_tunnel(Ipv4Addr::new(128, 0, 0, 0).into(), 1));
@@ -146,24 +261,14 @@ mod macos {
             match rm.add(&route) {
                 Ok(()) => {
                     tracing::info!(dst = %route.destination(), prefix = route.prefix(), "route added");
-                    added.push(route);
+                    state.routes.push(route);
                 }
                 Err(e) => {
                     tracing::warn!(dst = %route.destination(), prefix = route.prefix(), %e, "couldn't add route")
                 }
             }
         }
-        Ok(Installed { routes: added })
-    }
-
-    pub fn remove(routes: Vec<Route>) {
-        let Ok(mut rm) = RouteManager::new() else {
-            return;
-        };
-        for route in routes.iter().rev() {
-            // Routes on the utun device usually vanish with it already.
-            let _ = rm.delete(route);
-        }
+        Ok(Installed { macos: state })
     }
 }
 

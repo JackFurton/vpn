@@ -382,6 +382,15 @@ pub struct Device {
     /// an incoming datagram finds its peer without scanning them all.
     /// Entries go stale when sessions expire and `tick` sweeps them.
     by_index: HashMap<u32, usize>,
+    /// Set when any peer's endpoint moves, for `take_endpoints_changed`.
+    endpoints_changed: bool,
+}
+
+/// Points `endpoint` at `to`, returning whether it moved.
+fn move_endpoint(endpoint: &mut Option<SocketAddr>, to: SocketAddr) -> bool {
+    let moved = *endpoint != Some(to);
+    *endpoint = Some(to);
+    moved
 }
 
 impl Device {
@@ -402,6 +411,7 @@ impl Device {
             routes: AllowedIps::new(),
             by_key: HashMap::new(),
             by_index: HashMap::new(),
+            endpoints_changed: false,
         }
     }
 
@@ -429,6 +439,17 @@ impl Device {
             awaiting_reply: None,
             owe_keepalive: None,
         });
+    }
+
+    /// Whether any peer's endpoint changed since the last call. The host
+    /// uses this to keep routes to peers out of the tunnel (macOS).
+    pub fn take_endpoints_changed(&mut self) -> bool {
+        std::mem::take(&mut self.endpoints_changed)
+    }
+
+    /// Every peer endpoint currently known.
+    pub fn endpoints(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.peers.iter().filter_map(|p| p.endpoint)
     }
 
     pub fn stats(&self, now: Instant) -> Stats {
@@ -776,7 +797,7 @@ impl Device {
                 peer.last_init = Some(timestamp);
                 // The initiation proved the sender holds the peer's key and
                 // the timestamp proved it's fresh, so this is where it lives now.
-                peer.endpoint = Some(from);
+                self.endpoints_changed |= move_endpoint(&mut peer.endpoint, from);
                 self.by_index.insert(index, i);
                 peer.next = Some(Slot {
                     session,
@@ -817,7 +838,7 @@ impl Device {
                     born: now,
                     we_initiated: true,
                 });
-                peer.endpoint = Some(from);
+                self.endpoints_changed |= move_endpoint(&mut peer.endpoint, from);
                 peer.mark_received(now, false);
                 self.flush(i, true, now, out);
             }
@@ -889,7 +910,7 @@ impl Device {
         // NAT rebinding). Only the first copy of a packet gets this far.
         if peer.endpoint != Some(from) {
             debug!(peer = ?peer.public_key, old = ?peer.endpoint, new = %from, "peer roamed");
-            peer.endpoint = Some(from);
+            self.endpoints_changed |= move_endpoint(&mut peer.endpoint, from);
         }
 
         if matches!(which, Which::Next) {
@@ -1411,6 +1432,8 @@ mod tests {
         let mut net = Net::new();
         net.send_a(&to_b(1));
         assert_eq!(net.b.peers[0].endpoint, Some(A));
+        assert!(net.b.take_endpoints_changed(), "learned from the handshake");
+        assert!(!net.b.take_endpoints_changed(), "reported once");
 
         let moved: SocketAddr = "198.51.100.9:3000".parse().unwrap();
         let mut out = Outbox::new();
@@ -1420,6 +1443,8 @@ mod tests {
         net.b.handle_udp(wire, moved, net.now, &mut at_b);
         assert_eq!(at_b.iter().count(), 1, "packet delivered");
         assert_eq!(net.b.peers[0].endpoint, Some(moved));
+        assert!(net.b.take_endpoints_changed());
+        assert_eq!(net.b.endpoints().collect::<Vec<_>>(), [moved]);
 
         // B now answers at the new address.
         let mut reply = Outbox::new();
@@ -1438,6 +1463,7 @@ mod tests {
         let (_, wire) = out.iter().next().unwrap();
         let wire = wire.to_vec();
         net.pump(A, out);
+        net.b.take_endpoints_changed();
 
         let mut sink = Outbox::new();
         net.b.handle_udp(&wire, attacker, net.now, &mut sink);
@@ -1456,6 +1482,7 @@ mod tests {
             "forged counter fails auth"
         );
         assert!(sink.is_empty());
+        assert!(!net.b.take_endpoints_changed());
     }
 
     #[test]

@@ -16,6 +16,10 @@ cleanup() {
   status=$?
   [ $status -ne 0 ] && { echo "--- vpnd log"; cat "$WORK/vpnd.log" 2>/dev/null || true; }
   for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
+  if [ -n "${PF_TOKEN:-}" ]; then
+    pfctl -a com.apple/vpnd-test -F all 2>/dev/null || true
+    pfctl -X "$PF_TOKEN" 2>/dev/null || true
+  fi
   wait 2>/dev/null || true
   rm -rf "$WORK"
   exit $status
@@ -72,6 +76,31 @@ if [ "$(uname)" = Darwin ]; then
   ! route -n get 192.0.2.1 2>/dev/null | grep -q "interface: $IFACE"
 else
   ! ip route get 192.0.2.1 2>/dev/null | grep -q "dev $IFACE"
+fi
+
+if [ "$(uname)" = Darwin ]; then
+  echo "== full tunnel, server changes address"
+  # pf rewrites echo_peer's packets to come from 198.18.0.1, as if the
+  # server had moved there. The client follows, and 198.18.0.1 is only
+  # reachable by the default route, which the tunnel has captured. So vpnd
+  # has to add a host route for it through the real default route.
+  echo "nat on lo0 inet proto udp from 127.0.0.1 port 51820 to 127.0.0.1 -> 198.18.0.1 static-port" \
+    | pfctl -a com.apple/vpnd-test -f - 2>/dev/null
+  PF_TOKEN=$(pfctl -E 2>&1 | sed -n 's/^Token : //p')
+  run_client '"0.0.0.0/0"'
+  # Replies arrive from the new address; later pings are lost, since nothing
+  # on the real network answers 198.18.0.1.
+  ping -c 2 192.0.2.1 || true
+  grep -q "endpoint route added.*ep=198.18.0.1" "$WORK/vpnd.log"
+  via=$(route -n get 198.18.0.1 | awk '/interface:/ { print $2 }')
+  echo "198.18.0.1 goes out $via"
+  [ -n "$via" ] && [ "$via" != "$IFACE" ]
+  stop_client
+  pfctl -a com.apple/vpnd-test -F all 2>/dev/null
+  pfctl -X "$PF_TOKEN" 2>/dev/null
+  PF_TOKEN=
+  echo "== endpoint route removed after exit"
+  route -n get 198.18.0.1 | grep "destination: default" > /dev/null
 fi
 
 # Linux DNS goes through systemd-resolved, which tests/systemd.sh covers.
