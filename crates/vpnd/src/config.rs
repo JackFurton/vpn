@@ -11,6 +11,7 @@ use std::path::Path;
 use ipnet::IpNet;
 use serde::Deserialize;
 use vpn_proto::keys::{KeyError, PrivateKey, PublicKey};
+use zeroize::Zeroizing;
 
 pub const DEFAULT_MTU: u16 = 1420;
 /// IPv6 requires every link to carry 1280-byte packets.
@@ -112,6 +113,7 @@ impl Config {
             path: path.display().to_string(),
             source,
         })?;
+        let text = Zeroizing::new(text);
         Self::parse(&text)
     }
 
@@ -122,7 +124,9 @@ impl Config {
 
 fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     let i = raw.interface;
-    let private_key: PrivateKey = i.private_key.parse().map_err(ConfigError::PrivateKey)?;
+    let private_key: PrivateKey = Zeroizing::new(i.private_key)
+        .parse()
+        .map_err(ConfigError::PrivateKey)?;
     if i.addresses.is_empty() {
         return Err(ConfigError::NoAddress);
     }

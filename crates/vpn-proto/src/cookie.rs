@@ -16,6 +16,8 @@ use blake2::{Blake2s256, Blake2sMac};
 use chacha20poly1305::aead::AeadInOut;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
+use zeroize::Zeroizing;
+
 use crate::keys::PublicKey;
 use crate::wire::{COOKIE_LEN, COOKIE_REPLY_LEN, CookieReply, MAC_LEN, Message, TAG_LEN};
 
@@ -118,7 +120,7 @@ fn mac_offsets(msg: &[u8]) -> (usize, usize) {
 /// Responder side: issues cookies and checks mac2.
 pub struct CookieJar {
     keys: MacKeys,
-    secret: [u8; 32],
+    secret: Zeroizing<[u8; 32]>,
     secret_born: Instant,
 }
 
@@ -126,14 +128,14 @@ impl CookieJar {
     pub fn new(own: &MacKeys, now: Instant) -> Self {
         Self {
             keys: own.clone(),
-            secret: random(),
+            secret: Zeroizing::new(random()),
             secret_born: now,
         }
     }
 
     fn cookie_for(&mut self, from: SocketAddr, now: Instant) -> Cookie {
         if now.saturating_duration_since(self.secret_born) >= COOKIE_SECRET_LIFETIME {
-            self.secret = random();
+            self.secret = Zeroizing::new(random());
             self.secret_born = now;
         }
         let mut addr = [0u8; 18];
@@ -148,7 +150,7 @@ impl CookieJar {
             }
         };
         addr[ip_len..ip_len + 2].copy_from_slice(&from.port().to_be_bytes());
-        mac(&self.secret, &addr[..ip_len + 2])
+        mac(&*self.secret, &addr[..ip_len + 2])
     }
 
     /// Checks mac2 on a handshake message from `from`.
