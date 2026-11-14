@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use ipnet::IpNet;
 use tracing::{debug, trace};
 
+use crate::allowed_ips::AllowedIps;
 use crate::cookie::{COOKIE_USE_LIFETIME, Cookie, CookieJar, MacKeys};
 use crate::handshake::{HandshakeError, InitReceived, Initiator, Tai64N, read_init};
 use crate::ip::IpHeader;
@@ -279,7 +280,6 @@ enum Which {
 struct Peer {
     public_key: PublicKey,
     endpoint: Option<SocketAddr>,
-    allowed_ips: Vec<IpNet>,
     persistent_keepalive: Option<Duration>,
     /// Confirmed session we send on.
     current: Option<Slot>,
@@ -363,6 +363,8 @@ pub struct Device {
     cookie_limit: GlobalLimiter,
     drops: Drops,
     cookie_replies_sent: u64,
+    /// Every peer's allowed_ips, to peer index.
+    routes: AllowedIps<usize>,
 }
 
 impl Device {
@@ -380,10 +382,14 @@ impl Device {
             cookie_limit: GlobalLimiter::new(COOKIE_REPLIES_PER_SEC, COOKIE_REPLY_BURST),
             drops: Drops::default(),
             cookie_replies_sent: 0,
+            routes: AllowedIps::new(),
         }
     }
 
     pub fn add_peer(&mut self, c: PeerConfig) {
+        for net in &c.allowed_ips {
+            self.routes.insert(*net, self.peers.len());
+        }
         self.peers.push(Peer {
             keys: MacKeys::new(&c.public_key),
             cookie: None,
@@ -391,7 +397,6 @@ impl Device {
             last_handshake: None,
             public_key: c.public_key,
             endpoint: c.endpoint,
-            allowed_ips: c.allowed_ips,
             persistent_keepalive: c.persistent_keepalive,
             current: None,
             previous: None,
@@ -558,17 +563,7 @@ impl Device {
     }
 
     fn route(&self, dst: IpAddr) -> Option<usize> {
-        self.peers
-            .iter()
-            .enumerate()
-            .flat_map(|(i, p)| {
-                p.allowed_ips
-                    .iter()
-                    .filter(move |n| n.contains(&dst))
-                    .map(move |n| (n.prefix_len(), i))
-            })
-            .max_by_key(|&(len, _)| len)
-            .map(|(_, i)| i)
+        self.routes.lookup(dst).copied()
     }
 
     fn send_or_queue(&mut self, i: usize, packet: &[u8], now: Instant, out: &mut Outbox) {
@@ -857,8 +852,10 @@ impl Device {
         peer.counters.rx_bytes += (DATA_HEADER_LEN + d.ciphertext.len()) as u64;
         peer.counters.rx_packets += 1;
         let is_data = !packet.is_empty();
-        let allowed = IpHeader::parse(packet)
-            .is_some_and(|h| peer.allowed_ips.iter().any(|n| n.contains(&h.src)));
+        // Cryptokey routing: the source must be an address we'd route back
+        // to this same peer.
+        let allowed =
+            IpHeader::parse(packet).is_some_and(|h| self.routes.lookup(h.src) == Some(&i));
         if !is_data || !allowed {
             if is_data {
                 debug!(peer = ?peer.public_key, "dropping packet from a source outside allowed_ips");
