@@ -13,11 +13,12 @@ use snow::{Builder, HandshakeState};
 
 use crate::NOISE_PARAMS;
 use crate::keys::{KEY_LEN, PrivateKey, PublicKey};
-use crate::session::{Role, Session};
+use crate::session::{Keys, Role, Session};
 use crate::wire::{
     HANDSHAKE_INIT_LEN, HANDSHAKE_INIT_NOISE_LEN, HANDSHAKE_RESPONSE_LEN,
     HANDSHAKE_RESPONSE_NOISE_LEN, HandshakeInit, HandshakeResponse, MAC_LEN, Message,
 };
+use zeroize::Zeroizing;
 
 const PROLOGUE: &[u8] = b"JackFurton/vpn v1";
 const TIMESTAMP_LEN: usize = 12;
@@ -35,6 +36,8 @@ pub enum HandshakeError {
     Noise(#[from] snow::Error),
     #[error("handshake payload has unexpected length {0}")]
     BadPayload(usize),
+    #[error("handshake isn't finished")]
+    Unfinished,
     #[error("initiation timestamp is not newer than the last accepted one")]
     StaleTimestamp,
     #[error("response is addressed to index {got}, expected {expected}")]
@@ -64,6 +67,27 @@ impl Tai64N {
             .unwrap_or_default();
         Self::from_unix(d.as_secs(), d.subsec_nanos())
     }
+}
+
+/// Takes the transport keys out of a finished handshake, so they live in
+/// ciphers that wipe them rather than in snow's transport state, which
+/// doesn't.
+fn split(state: &mut HandshakeState, role: Role) -> Result<Keys, HandshakeError> {
+    if !state.is_handshake_finished() {
+        return Err(HandshakeError::Unfinished);
+    }
+    let (i2r, r2i) = state.dangerously_get_raw_split();
+    let (i2r, r2i) = (Zeroizing::new(i2r), Zeroizing::new(r2i));
+    Ok(match role {
+        Role::Initiator => Keys {
+            send: i2r,
+            recv: r2i,
+        },
+        Role::Responder => Keys {
+            send: r2i,
+            recv: i2r,
+        },
+    })
 }
 
 fn builder(local: &PrivateKey) -> Result<Builder<'_>, snow::Error> {
@@ -127,7 +151,7 @@ impl Initiator {
         Ok(Session::new(
             self.sender_index,
             msg.sender_index,
-            self.state.into_stateless_transport_mode()?,
+            split(&mut self.state, Role::Initiator)?,
             Role::Initiator,
         ))
     }
@@ -201,7 +225,7 @@ impl InitReceived {
         Ok(Session::new(
             sender_index,
             self.initiator_index,
-            self.state.into_stateless_transport_mode()?,
+            split(&mut self.state, Role::Responder)?,
             Role::Responder,
         ))
     }
@@ -246,12 +270,18 @@ mod tests {
         }
     }
 
-    fn round_trip(s: &Session, to: &Session, nonce: u64) {
-        let mut ct = [0; 64];
+    const PING: [u8; 20] = [
+        0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
+    ];
+
+    fn round_trip(s: &mut Session, to: &mut Session) {
+        let mut wire = [0; 64];
+        let n = s.encrypt(&PING, 1420, &mut wire).unwrap();
+        let Ok(Message::Data(d)) = Message::parse(&wire[..n]) else {
+            panic!("not data")
+        };
         let mut pt = [0; 64];
-        let n = s.transport.write_message(nonce, b"ping", &mut ct).unwrap();
-        let n = to.transport.read_message(nonce, &ct[..n], &mut pt).unwrap();
-        assert_eq!(&pt[..n], b"ping");
+        assert_eq!(to.decrypt(&d, &mut pt).unwrap(), PING);
     }
 
     #[test]
@@ -267,8 +297,9 @@ mod tests {
 
         assert_eq!((i_session.local_index, i_session.remote_index), (11, 22));
         assert_eq!((r_session.local_index, r_session.remote_index), (22, 11));
-        round_trip(&i_session, &r_session, 0);
-        round_trip(&r_session, &i_session, 0);
+        let (mut i_session, mut r_session) = (i_session, r_session);
+        round_trip(&mut i_session, &mut r_session);
+        round_trip(&mut r_session, &mut i_session);
     }
 
     #[test]
@@ -341,5 +372,55 @@ mod tests {
         let b = Tai64N::from_unix(101, 0);
         assert!(a < b);
         assert!(Tai64N::from_unix(100, 1) > Tai64N::from_unix(100, 0));
+    }
+
+    // Our transport must stay byte-compatible with snow's, which is what the
+    // wire format in docs/protocol.md was specified against.
+    #[test]
+    fn transport_matches_snow_on_the_wire() {
+        let p = Pair::new();
+        let mut i = builder(&p.i.private)
+            .unwrap()
+            .remote_public_key(p.r.public.as_bytes())
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut r = builder(&p.r.private).unwrap().build_responder().unwrap();
+        let (mut m1, mut m2, mut scratch) = ([0u8; 256], [0u8; 256], [0u8; 256]);
+        let n = i.write_message(&[0; 12], &mut m1).unwrap();
+        r.read_message(&m1[..n], &mut scratch).unwrap();
+        let n = r.write_message(&[], &mut m2).unwrap();
+        i.read_message(&m2[..n], &mut scratch).unwrap();
+
+        let mut ours = Session::new(
+            1,
+            2,
+            split(&mut i, Role::Initiator).unwrap(),
+            Role::Initiator,
+        );
+        let snow_r = r.into_stateless_transport_mode().unwrap();
+
+        // Non-zero counters: at 0 every nonce layout is all zeros.
+        ours.send_counter = 0x0102_0304_0506;
+        // Ours encrypts, snow decrypts.
+        let mut wire = [0u8; 64];
+        let n = ours.encrypt(&PING, 1420, &mut wire).unwrap();
+        let counter = u64::from_le_bytes(wire[8..16].try_into().unwrap());
+        let mut pt = [0u8; 64];
+        let m = snow_r.read_message(counter, &wire[16..n], &mut pt).unwrap();
+        assert_eq!(&pt[..PING.len()], PING);
+        assert!(pt[PING.len()..m].iter().all(|&b| b == 0), "zero padding");
+
+        // Snow encrypts, ours decrypts.
+        let mut ct = [0u8; 64];
+        let n = snow_r.write_message(0x0a0b_0c0d, &PING, &mut ct).unwrap();
+        let mut msg = vec![4, 0, 0, 0];
+        msg.extend_from_slice(&1u32.to_le_bytes());
+        msg.extend_from_slice(&0x0a0b_0c0du64.to_le_bytes());
+        msg.extend_from_slice(&ct[..n]);
+        let Ok(Message::Data(d)) = Message::parse(&msg) else {
+            panic!("not data")
+        };
+        assert_eq!(ours.decrypt(&d, &mut pt).unwrap(), PING);
     }
 }
