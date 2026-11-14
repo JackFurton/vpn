@@ -34,7 +34,8 @@ pub async fn up(
 
     let port = iface.listen_port.unwrap_or(0);
     let routes = crate::routes::plan(&config);
-    let mark = routes.needs_mark().then_some(crate::routes::FWMARK);
+    // Linux steers around the tunnel by socket mark; macOS uses host routes.
+    let mark = (cfg!(target_os = "linux") && routes.has_default()).then_some(crate::routes::FWMARK);
     let udp = Udp::bind(port, mark).with_context(|| format!("binding UDP port {port}"))?;
     let tun = Tun::create(interface, &iface.addresses, iface.mtu)
         .context("creating TUN device (needs root or CAP_NET_ADMIN)")?;

@@ -35,7 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         match socket.recv_from(&mut buf) {
             Ok((n, from)) => device.handle_udp(&buf[..n], from, now, &mut out),
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(e) => return Err(e.into()),
         }
         device.tick(now, &mut out);

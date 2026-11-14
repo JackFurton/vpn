@@ -44,7 +44,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn needs_mark(&self) -> bool {
+    pub fn has_default(&self) -> bool {
         self.default_v4 || self.default_v6
     }
 }
@@ -109,7 +109,7 @@ mod macos {
         let on_tunnel = |dst: IpAddr, len: u8| Route::new(dst, len).with_if_name(ifname.to_owned());
 
         let mut wanted: Vec<Route> = Vec::new();
-        if plan.needs_mark() {
+        if plan.has_default() {
             // Pin each endpoint to its current path before the /1s capture it.
             for &ep in &plan.endpoints {
                 let current = rm
@@ -340,7 +340,7 @@ mod tests {
         );
         let p = plan(&c);
         assert_eq!(p.routes, vec!["192.168.50.0/24".parse::<IpNet>().unwrap()]);
-        assert!(!p.needs_mark());
+        assert!(!p.has_default());
     }
 
     #[test]
@@ -350,7 +350,7 @@ mod tests {
             &[&["0.0.0.0/0", "::/0"], &["172.16.0.0/12"]],
         );
         let p = plan(&c);
-        assert!(p.default_v4 && p.default_v6 && p.needs_mark());
+        assert!(p.default_v4 && p.default_v6 && p.has_default());
         assert_eq!(p.routes, vec!["172.16.0.0/12".parse::<IpNet>().unwrap()]);
     }
 }
