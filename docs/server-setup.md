@@ -20,6 +20,29 @@ tunnel subnet as its `allowed_ips`.
 Open UDP 51820 (or whichever `listen_port` you chose) in any cloud firewall
 or security group in front of the server.
 
+### Run it as a service
+
+```sh
+sudo mv server.toml /etc/vpnd/vpn0.toml   # root:root, mode 600
+sudo install -m 644 packaging/systemd/vpnd@.service /etc/systemd/system/
+sudo systemctl enable --now vpnd@vpn0
+journalctl -u vpnd@vpn0 -f
+```
+
+The instance name is both the config file's name and the interface name.
+The unit runs vpnd as a throwaway user that has only `CAP_NET_ADMIN`.
+systemd hands it a private copy of the config through `LoadCredential`, so
+the file can stay readable only by root. vpnd gives up the capability once
+the tunnel is up.
+
+Or with Docker:
+
+```sh
+docker build -t vpnd .
+docker run -d --cap-add NET_ADMIN --device /dev/net/tun -p 51820:51820/udp \
+  -v /etc/vpnd/vpn0.toml:/etc/vpnd/vpnd.toml:ro vpnd
+```
+
 ## 2. Turn on forwarding
 
 By default Linux only delivers packets addressed to itself and drops the
