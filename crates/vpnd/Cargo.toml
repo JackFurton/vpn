@@ -20,7 +20,7 @@ toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tun-rs = { version = "2.8.18", features = ["async"] }
-vpn-proto = { version = "0.1.0", path = "../vpn-proto" }
+vpn-proto = { version = "0.2.0", path = "../vpn-proto" }
 zeroize = "1.9.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
