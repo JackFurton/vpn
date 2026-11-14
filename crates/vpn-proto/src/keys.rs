@@ -4,6 +4,9 @@ use std::str::FromStr;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
+use snow::params::DHChoice;
+use snow::resolvers::{CryptoResolver, DefaultResolver};
+
 use crate::NOISE_PARAMS;
 
 pub const KEY_LEN: usize = 32;
@@ -36,6 +39,16 @@ impl KeyPair {
             private: PrivateKey(to_array(&kp.private)?),
             public: PublicKey(to_array(&kp.public)?),
         })
+    }
+}
+
+impl PrivateKey {
+    pub fn public_key(&self) -> PublicKey {
+        let mut dh = DefaultResolver
+            .resolve_dh(&DHChoice::Curve25519)
+            .expect("default resolver supports Curve25519");
+        dh.set(&self.0);
+        PublicKey(to_array(dh.pubkey()).expect("Curve25519 public keys are 32 bytes"))
     }
 }
 
@@ -96,6 +109,12 @@ mod tests {
         let private: PrivateKey = kp.private.to_base64().parse().unwrap();
         assert_eq!(public, kp.public);
         assert_eq!(private.as_bytes(), kp.private.as_bytes());
+    }
+
+    #[test]
+    fn derives_public_from_private() {
+        let kp = KeyPair::generate().unwrap();
+        assert_eq!(kp.private.public_key(), kp.public);
     }
 
     #[test]

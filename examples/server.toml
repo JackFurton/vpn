@@ -1,0 +1,20 @@
+# Server with two clients. Generate keys with `vpnd keygen`.
+# This file holds a private key: chmod 600 it.
+
+[interface]
+private_key = "<PRIVATE_KEY>"
+listen_port = 51820
+# Our address inside the tunnel. The /24 tells the OS which destinations to
+# route into the tunnel interface.
+addresses = ["10.8.0.1/24"]
+# mtu = 1420  # default; see docs/protocol.md for the math
+
+[[peer]]
+public_key = "<PEER_PUBLIC_KEY>"
+# Packets from this peer must come from these addresses, and packets to these
+# addresses go to this peer. Must not overlap another peer's.
+allowed_ips = ["10.8.0.2/32"]
+
+[[peer]]
+public_key = "<PEER2_PUBLIC_KEY>"
+allowed_ips = ["10.8.0.3/32"]
