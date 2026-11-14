@@ -1715,6 +1715,7 @@ dependencies = [
  "futures-util",
  "ipnet",
  "nix 0.31.3",
+ "route_manager",
  "rtnetlink",
  "serde",
  "socket2",

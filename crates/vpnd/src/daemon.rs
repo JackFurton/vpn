@@ -38,14 +38,12 @@ pub async fn up(
     let udp = Udp::bind(port, mark).with_context(|| format!("binding UDP port {port}"))?;
     let tun = Tun::create(interface, &iface.addresses, iface.mtu)
         .context("creating TUN device (needs root or CAP_NET_ADMIN)")?;
-    #[cfg(target_os = "linux")]
-    crate::routes::apply(&routes, tun.name())
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let installed = crate::routes::apply(&routes, tun.name())
         .await
         .context("installing routes")?;
-    #[cfg(not(target_os = "linux"))]
-    if routes.needs_mark() || !routes.routes.is_empty() {
-        tracing::warn!("routes for allowed_ips are only installed automatically on Linux so far");
-    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let installed = crate::routes::Installed::default();
 
     tracing::info!(
         interface = tun.name(),
@@ -72,7 +70,9 @@ pub async fn up(
     // Everything privileged is open; nothing after this needs privilege.
     // Tearing the interface down on exit only needs the fd closed.
     crate::privdrop::drop_privileges(user)?;
-    event_loop::run(device, &tun, &udp, mtu, metrics, shutdown).await?;
+    let result = event_loop::run(device, &tun, &udp, mtu, metrics, shutdown).await;
+    installed.remove();
+    result?;
     // Dropping the TUN fd removes the interface and its routes.
     tracing::info!(interface = tun.name(), "tunnel down");
     Ok(())
