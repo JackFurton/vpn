@@ -1,5 +1,5 @@
 //! A tunnel peer with no TUN device: it answers ICMP echo requests that
-//! arrive through the tunnel. Lets one machine test a real vpnd end to end
+//! arrive through the tunnel, and DNS queries for A records with 192.0.2.53. Lets one machine test a real vpnd end to end
 //! (ping goes into the OS's tunnel interface, through vpnd, here, and back)
 //! without a second host or a second interface.
 //!
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Dest::Udp(to) => {
                         socket.send_to(bytes, to)?;
                     }
-                    Dest::Tun => replies.extend(echo_reply(bytes)),
+                    Dest::Tun => replies.extend(echo_reply(bytes).or_else(|| dns_reply(bytes))),
                 }
             }
             out.clear();
@@ -78,6 +78,54 @@ fn echo_reply(packet: &[u8]) -> Option<Vec<u8>> {
     p[ihl + 2..ihl + 4].fill(0);
     let sum = checksum(&p[ihl..]);
     p[ihl + 2..ihl + 4].copy_from_slice(&sum.to_be_bytes());
+    Some(p)
+}
+
+/// Answers an IPv4 UDP DNS query: 192.0.2.53 for A, an empty NOERROR for
+/// anything else (macOS asks for AAAA alongside A).
+fn dns_reply(packet: &[u8]) -> Option<Vec<u8>> {
+    let ihl = usize::from(packet.first()? & 0x0f) * 4;
+    if packet[0] >> 4 != 4 || packet.get(9) != Some(&17) || packet.len() < ihl + 8 + 12 {
+        return None;
+    }
+    let udp = &packet[ihl..];
+    if u16::from_be_bytes([udp[2], udp[3]]) != 53 {
+        return None;
+    }
+    let query = &udp[8..];
+    // Question: labels up to a zero byte, then QTYPE and QCLASS.
+    let mut end = 12;
+    while *query.get(end)? != 0 {
+        end += 1 + usize::from(query[end]);
+    }
+    let question = query.get(12..end + 5)?;
+    let is_a =
+        u16::from_be_bytes([question[question.len() - 4], question[question.len() - 3]]) == 1;
+
+    let mut dns = Vec::new();
+    dns.extend_from_slice(&query[..2]); // same ID
+    dns.extend_from_slice(&[0x81, 0x80, 0, 1, 0, u8::from(is_a), 0, 0, 0, 0]);
+    dns.extend_from_slice(question);
+    if is_a {
+        // Name pointer to the question, A, IN, TTL 60, 4 bytes of address.
+        dns.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 53]);
+    }
+
+    let total = 20 + 8 + dns.len();
+    let mut p = vec![0u8; 20];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    p[8] = 64;
+    p[9] = 17;
+    p[12..16].copy_from_slice(&packet[16..20]);
+    p[16..20].copy_from_slice(&packet[12..16]);
+    let sum = checksum(&p);
+    p[10..12].copy_from_slice(&sum.to_be_bytes());
+    p.extend_from_slice(&udp[2..4]); // source port 53
+    p.extend_from_slice(&udp[0..2]); // back to the asker's port
+    p.extend_from_slice(&((8 + dns.len()) as u16).to_be_bytes());
+    p.extend_from_slice(&[0, 0]); // UDP checksum is optional over IPv4
+    p.extend_from_slice(&dns);
     Some(p)
 }
 

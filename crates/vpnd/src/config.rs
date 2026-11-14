@@ -5,7 +5,7 @@
 //! error can name the peer it's about.
 
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use ipnet::IpNet;
@@ -33,6 +33,8 @@ pub struct Interface {
     pub mtu: u16,
     /// Where to serve Prometheus metrics, if anywhere.
     pub metrics: Option<SocketAddr>,
+    /// DNS servers to use while the tunnel is up. Empty leaves DNS alone.
+    pub dns: Vec<IpAddr>,
 }
 
 #[derive(Debug)]
@@ -94,6 +96,8 @@ struct RawInterface {
     addresses: Vec<IpNet>,
     mtu: Option<u16>,
     metrics: Option<SocketAddr>,
+    #[serde(default)]
+    dns: Vec<IpAddr>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +193,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
             addresses: i.addresses,
             mtu,
             metrics: i.metrics,
+            dns: i.dns,
         },
         peers,
     })
@@ -257,6 +262,13 @@ mod tests {
         assert_eq!(p.endpoint, Some("203.0.113.5:51820".parse().unwrap()));
         assert_eq!(p.allowed_ips.len(), 2);
         assert_eq!(p.persistent_keepalive, Some(25));
+    }
+
+    #[test]
+    fn parses_dns() {
+        let c = Config::parse(&config("dns = [\"10.8.0.1\", \"fd08::1\"]\n")).unwrap();
+        assert_eq!(c.interface.dns.len(), 2);
+        assert!(Config::parse(&config("dns = [\"not-an-ip\"]\n")).is_err());
     }
 
     #[test]
