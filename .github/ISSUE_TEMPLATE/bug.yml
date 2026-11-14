@@ -1,0 +1,16 @@
+name: Bug
+description: Something is broken
+labels: [type/bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened
+      description: Expected vs actual. Paste the shortest log line that shows it.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Repro
+      description: OS, vpnd version, config (redact private keys), steps.
+    validations:
+      required: true
