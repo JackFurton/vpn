@@ -2,6 +2,11 @@
 //! IP versions, but the kernel then reports IPv4 peers as v4-mapped IPv6
 //! (`::ffff:a.b.c.d`) and expects them back in that form. This module
 //! translates at the edge, so `Device` only ever sees plain IPv4 or IPv6.
+//!
+//! On Linux it also batches: UDP_SEGMENT (GSO) sends a run of equal-sized
+//! datagrams to one address in a single sendmsg, and UDP_GRO hands back
+//! several datagrams from one sender in a single recvmsg. Both cut the
+//! syscalls per packet, which is what limits throughput (docs/benchmarks.md).
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -12,6 +17,47 @@ use tokio::net::UdpSocket;
 pub struct Udp {
     socket: UdpSocket,
     dual_stack: bool,
+    /// Cleared if the kernel refuses a GSO send, after which runs go out
+    /// one datagram at a time.
+    #[cfg(target_os = "linux")]
+    gso: std::sync::atomic::AtomicBool,
+}
+
+/// The kernel caps a GSO send at 64 segments and one IP datagram's worth of
+/// payload.
+#[cfg(target_os = "linux")]
+const GSO_MAX_SEGMENTS: usize = 64;
+#[cfg(target_os = "linux")]
+const GSO_MAX_BYTES: usize = 65_000;
+
+/// What one receive returned: a single datagram, or with GRO several from
+/// the same sender packed `stride` bytes apart (the last may be shorter).
+pub struct UdpRx {
+    buf: Vec<u8>,
+    len: usize,
+    stride: usize,
+    from: SocketAddr,
+}
+
+impl Default for UdpRx {
+    fn default() -> Self {
+        Self {
+            buf: vec![0; 65_535],
+            len: 0,
+            stride: 0,
+            from: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        }
+    }
+}
+
+impl UdpRx {
+    pub fn from(&self) -> SocketAddr {
+        self.from
+    }
+
+    pub fn datagrams(&self) -> impl Iterator<Item = &[u8]> {
+        self.buf[..self.len].chunks(self.stride.max(1))
+    }
 }
 
 impl Udp {
@@ -21,10 +67,7 @@ impl Udp {
     /// apart; it needs CAP_NET_ADMIN.
     pub fn bind(port: u16, mark: Option<u32>) -> io::Result<Self> {
         match bind_dual_stack(port, mark) {
-            Ok(socket) => Ok(Self {
-                socket,
-                dual_stack: true,
-            }),
+            Ok(socket) => Ok(Self::new(socket, true)),
             Err(e) => {
                 tracing::warn!(%e, "IPv6 unavailable, listening on IPv4 only");
                 let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -32,11 +75,23 @@ impl Udp {
                 socket.set_nonblocking(true)?;
                 socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
                 let std: std::net::UdpSocket = socket.into();
-                Ok(Self {
-                    socket: UdpSocket::from_std(std)?,
-                    dual_stack: false,
-                })
+                Ok(Self::new(UdpSocket::from_std(std)?, false))
             }
+        }
+    }
+
+    fn new(socket: UdpSocket, dual_stack: bool) -> Self {
+        #[cfg(target_os = "linux")]
+        if let Err(e) =
+            nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::UdpGroSegment, &true)
+        {
+            tracing::debug!(%e, "UDP GRO unavailable");
+        }
+        Self {
+            socket,
+            dual_stack,
+            #[cfg(target_os = "linux")]
+            gso: true.into(),
         }
     }
 
@@ -44,14 +99,140 @@ impl Udp {
         self.socket.local_addr()
     }
 
-    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (n, from) = self.socket.recv_from(buf).await?;
-        Ok((n, unmap(from)))
+    /// How many datagrams of up to `max_len` bytes one `send_run` can carry.
+    pub fn max_segments(&self, max_len: usize) -> usize {
+        #[cfg(target_os = "linux")]
+        return (GSO_MAX_BYTES / max_len.max(1)).clamp(1, GSO_MAX_SEGMENTS);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = max_len;
+            1
+        }
     }
 
-    pub async fn send_to(&self, buf: &[u8], to: SocketAddr) -> io::Result<usize> {
+    pub async fn recv_batch(&self, rx: &mut UdpRx) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let (len, stride, from) = self
+            .socket
+            .async_io(tokio::io::Interest::READABLE, || {
+                gro::recv(&self.socket, &mut rx.buf)
+            })
+            .await?;
+        #[cfg(not(target_os = "linux"))]
+        let (len, stride, from) = {
+            let (n, from) = self.socket.recv_from(&mut rx.buf).await?;
+            (n, n, from)
+        };
+        rx.len = len;
+        rx.stride = stride;
+        rx.from = unmap(from);
+        Ok(())
+    }
+
+    /// Sends `bytes` to `to` as datagrams of `segment` bytes each (the last
+    /// may be shorter), in one syscall where GSO allows.
+    pub async fn send_run(&self, bytes: &[u8], segment: usize, to: SocketAddr) -> io::Result<()> {
         let to = if self.dual_stack { map(to) } else { to };
-        self.socket.send_to(buf, to).await
+        #[cfg(target_os = "linux")]
+        if bytes.len() > segment && self.gso.load(std::sync::atomic::Ordering::Relaxed) {
+            let r = self
+                .socket
+                .async_io(tokio::io::Interest::WRITABLE, || {
+                    gro::send(&self.socket, bytes, segment, to)
+                })
+                .await;
+            match r {
+                Ok(()) => return Ok(()),
+                // EIO: the egress device can't checksum for us. EINVAL: GSO
+                // isn't supported on this socket at all.
+                Err(e) if matches!(e.raw_os_error(), Some(libc_code) if libc_code == nix::libc::EIO || libc_code == nix::libc::EINVAL) =>
+                {
+                    tracing::warn!(%e, "UDP GSO send failed, sending datagrams one at a time from now on");
+                    self.gso.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let mut result = Ok(());
+        for datagram in bytes.chunks(segment) {
+            if let Err(e) = self.socket.send_to(datagram, to).await {
+                result = Err(e);
+            }
+        }
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod gro {
+    use std::io::{self, IoSlice, IoSliceMut};
+    use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::socket::{
+        ControlMessage, ControlMessageOwned, MsgFlags, SockaddrLike, SockaddrStorage, recvmsg,
+        sendmsg,
+    };
+    use tokio::net::UdpSocket;
+
+    /// One recvmsg. Returns total length, segment stride and sender.
+    pub fn recv(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, usize, SocketAddr)> {
+        let mut iov = [IoSliceMut::new(buf)];
+        let mut cmsg = nix::cmsg_space!(i32);
+        let msg = recvmsg::<SockaddrStorage>(
+            socket.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg),
+            MsgFlags::empty(),
+        )?;
+        let mut stride = msg.bytes;
+        for c in msg.cmsgs()? {
+            if let ControlMessageOwned::UdpGroSegments(s) = c {
+                stride = usize::try_from(s).unwrap_or(msg.bytes);
+            }
+        }
+        let from = msg
+            .address
+            .as_ref()
+            .and_then(to_socket_addr)
+            .ok_or_else(|| io::Error::other("datagram without a source address"))?;
+        Ok((msg.bytes, stride, from))
+    }
+
+    pub fn send(
+        socket: &UdpSocket,
+        bytes: &[u8],
+        segment: usize,
+        to: SocketAddr,
+    ) -> io::Result<()> {
+        let segment = u16::try_from(segment).map_err(|_| io::Error::other("segment too large"))?;
+        let addr = SockaddrStorage::from(to);
+        let sent = sendmsg(
+            socket.as_raw_fd(),
+            &[IoSlice::new(bytes)],
+            &[ControlMessage::UdpGsoSegments(&segment)],
+            MsgFlags::empty(),
+            Some(&addr),
+        )?;
+        if sent != bytes.len() {
+            return Err(io::Error::other(format!(
+                "GSO send wrote {sent} of {} bytes",
+                bytes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn to_socket_addr(s: &SockaddrStorage) -> Option<SocketAddr> {
+        match s.family()? {
+            nix::sys::socket::AddressFamily::Inet => {
+                s.as_sockaddr_in().map(|a| SocketAddrV4::from(*a).into())
+            }
+            nix::sys::socket::AddressFamily::Inet6 => {
+                s.as_sockaddr_in6().map(|a| SocketAddrV6::from(*a).into())
+            }
+            _ => None,
+        }
     }
 }
 
@@ -124,18 +305,46 @@ mod tests {
             (&v6, format!("[::1]:{port}")),
         ] {
             client.send_to(b"ping", &to).await.unwrap();
-            let mut buf = [0; 16];
-            let (n, from) = server.recv_from(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], b"ping");
+            let mut rx = UdpRx::default();
+            server.recv_batch(&mut rx).await.unwrap();
+            assert_eq!(rx.datagrams().collect::<Vec<_>>(), [b"ping"]);
+            let from = rx.from();
             assert_eq!(
                 from,
                 client.local_addr().unwrap(),
                 "plain address, not v4-mapped"
             );
 
-            server.send_to(b"pong", from).await.unwrap();
+            server.send_run(b"pong", 4, from).await.unwrap();
+            let mut buf = [0; 16];
             let n = client.recv(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], b"pong");
         }
+    }
+
+    /// One send_run of four datagrams arrives as four datagrams, whether or
+    /// not GSO and GRO batched them on the way.
+    #[tokio::test]
+    async fn runs_arrive_as_separate_datagrams() {
+        let a = Udp::bind(0, None).unwrap();
+        let b = Udp::bind(0, None).unwrap();
+        let to = SocketAddr::from((Ipv4Addr::LOCALHOST, b.local_addr().unwrap().port()));
+        let mut run = Vec::new();
+        for (i, len) in [100, 100, 100, 50].into_iter().enumerate() {
+            run.extend(std::iter::repeat_n(i as u8, len));
+        }
+        assert!(a.max_segments(100) >= 4 || cfg!(not(target_os = "linux")));
+        a.send_run(&run, 100, to).await.unwrap();
+
+        let mut got = Vec::new();
+        let mut rx = UdpRx::default();
+        while got.len() < 4 {
+            tokio::time::timeout(std::time::Duration::from_secs(2), b.recv_batch(&mut rx))
+                .await
+                .expect("all four should arrive")
+                .unwrap();
+            got.extend(rx.datagrams().map(|d| (d[0], d.len())));
+        }
+        assert_eq!(got, [(0, 100), (1, 100), (2, 100), (3, 50)]);
     }
 }

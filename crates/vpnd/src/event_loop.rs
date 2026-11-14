@@ -9,30 +9,30 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use vpn_proto::device::{Dest, Device, Outbox};
+use vpn_proto::session::Session;
 
-use crate::tun::Tun;
-use crate::udp::Udp;
+use crate::tun::{Tun, TunRx, TunTx};
+use crate::udp::{Udp, UdpRx};
 
 /// Retries are on a 5s scale; 250ms keeps them within a tick of on time.
 const TICK: Duration = Duration::from_millis(250);
-const MAX_DATAGRAM: usize = 65_535;
 /// Rendering is cheap, but a scrape never needs fresher numbers than this.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
 
 /// Packet IO the loop needs from a TUN device. A trait so tests can use
 /// channels instead of a real interface, which needs root.
 pub trait PacketDevice {
-    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
-    fn send(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
+    fn recv_batch(&self, rx: &mut TunRx) -> impl Future<Output = io::Result<()>> + Send;
+    fn send_batch(&self, tx: &mut TunTx) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 impl PacketDevice for Tun {
-    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send {
-        Tun::recv(self, buf)
+    fn recv_batch(&self, rx: &mut TunRx) -> impl Future<Output = io::Result<()>> + Send {
+        Tun::recv_batch(self, rx)
     }
 
-    fn send(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
-        Tun::send(self, packet)
+    fn send_batch(&self, tx: &mut TunTx) -> impl Future<Output = io::Result<()>> + Send {
+        Tun::send_batch(self, tx)
     }
 }
 
@@ -48,8 +48,10 @@ pub async fn run(
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let mut last_publish: Option<Instant> = None;
-    let mut tun_buf = vec![0; mtu];
-    let mut udp_buf = vec![0; MAX_DATAGRAM];
+    let mut tun_rx = TunRx::new(mtu);
+    let mut tun_tx = TunTx::default();
+    let mut udp_rx = UdpRx::default();
+    let max_segments = udp.max_segments(Session::encrypted_len(mtu, mtu));
     let mut out = Outbox::new();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -59,12 +61,20 @@ pub async fn run(
         // Every branch is cancel-safe: losing the race drops a future that
         // hasn't consumed anything yet.
         tokio::select! {
-            r = tun.recv(&mut tun_buf) => {
-                let n = r?;
-                device.handle_tun(&tun_buf[..n], Instant::now(), &mut out);
+            r = tun.recv_batch(&mut tun_rx) => {
+                r?;
+                let now = Instant::now();
+                for packet in tun_rx.packets() {
+                    device.handle_tun(packet, now, &mut out);
+                }
             }
-            r = udp.recv_from(&mut udp_buf) => match r {
-                Ok((n, from)) => device.handle_udp(&udp_buf[..n], from, Instant::now(), &mut out),
+            r = udp.recv_batch(&mut udp_rx) => match r {
+                Ok(()) => {
+                    let now = Instant::now();
+                    for datagram in udp_rx.datagrams() {
+                        device.handle_udp(datagram, udp_rx.from(), now, &mut out);
+                    }
+                }
                 // Some platforms surface ICMP errors from earlier sends here.
                 // They say nothing about this socket's health.
                 Err(e) => tracing::debug!(%e, "UDP receive error"),
@@ -88,19 +98,20 @@ pub async fn run(
             on_endpoints(device.endpoints().map(|e| e.ip()).collect());
         }
 
-        for (dest, bytes) in out.iter() {
-            match dest {
-                Dest::Udp(to) => {
-                    if let Err(e) = udp.send_to(bytes, to).await {
-                        tracing::debug!(%to, %e, "UDP send failed");
-                    }
-                }
-                Dest::Tun => {
-                    if let Err(e) = tun.send(bytes).await {
-                        tracing::warn!(%e, "TUN write failed");
-                    }
-                }
+        for (to, bytes, segment) in out.udp_runs(max_segments) {
+            if let Err(e) = udp.send_run(bytes, segment, to).await {
+                tracing::debug!(%to, %e, "UDP send failed");
             }
+        }
+        for (dest, bytes) in out.iter() {
+            if dest == Dest::Tun {
+                tun_tx.push(bytes);
+            }
+        }
+        if !tun_tx.is_empty()
+            && let Err(e) = tun.send_batch(&mut tun_tx).await
+        {
+            tracing::warn!(%e, "TUN write failed");
         }
         out.clear();
     }
@@ -122,18 +133,22 @@ mod tests {
     }
 
     impl PacketDevice for ChannelTun {
-        async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        async fn recv_batch(&self, rx: &mut TunRx) -> io::Result<()> {
             let p = self.from_kernel.lock().await.recv().await;
             let p = p.ok_or_else(|| io::Error::other("closed"))?;
-            buf[..p.len()].copy_from_slice(&p);
-            Ok(p.len())
+            rx.set(&p);
+            Ok(())
         }
 
-        async fn send(&self, packet: &[u8]) -> io::Result<()> {
-            self.to_kernel
-                .send(packet.to_vec())
-                .await
-                .map_err(|_| io::Error::other("closed"))
+        async fn send_batch(&self, tx: &mut TunTx) -> io::Result<()> {
+            for packet in tx.packets() {
+                self.to_kernel
+                    .send(packet.to_vec())
+                    .await
+                    .map_err(|_| io::Error::other("closed"))?;
+            }
+            tx.clear();
+            Ok(())
         }
     }
 

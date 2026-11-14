@@ -109,18 +109,21 @@ async fn main() -> Result<()> {
 async fn tun_dump(addresses: &[IpNet], name: Option<&str>, mtu: u16) -> Result<()> {
     let tun = Tun::create(name, addresses, mtu).context("creating TUN device (needs root)")?;
     tracing::info!(interface = tun.name(), ?addresses, mtu, "TUN device up");
-    let mut buf = vec![0; usize::from(mtu)];
+    let mut rx = vpnd::tun::TunRx::new(usize::from(mtu));
     loop {
         tokio::select! {
-            n = tun.recv(&mut buf) => {
-                let n = n?;
-                match IpHeader::parse(&buf[..n]) {
-                    Some(h) => tracing::info!(
-                        "{} {} -> {} proto {} len {n}",
-                        if h.src.is_ipv4() { "IPv4" } else { "IPv6" },
-                        h.src, h.dst, h.protocol
-                    ),
-                    None => tracing::info!("non-IP packet, len {n}"),
+            r = tun.recv_batch(&mut rx) => {
+                r?;
+                for packet in rx.packets() {
+                    let n = packet.len();
+                    match IpHeader::parse(packet) {
+                        Some(h) => tracing::info!(
+                            "{} {} -> {} proto {} len {n}",
+                            if h.src.is_ipv4() { "IPv4" } else { "IPv6" },
+                            h.src, h.dst, h.protocol
+                        ),
+                        None => tracing::info!("non-IP packet, len {n}"),
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => return Ok(()),
