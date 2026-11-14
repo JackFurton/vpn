@@ -4,10 +4,8 @@ use std::str::FromStr;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
-use snow::params::DHChoice;
-use snow::resolvers::{CryptoResolver, DefaultResolver};
-
-use crate::NOISE_PARAMS;
+use curve25519_dalek::MontgomeryPoint;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const KEY_LEN: usize = 32;
 
@@ -18,13 +16,15 @@ pub enum KeyError {
     #[error("key must be {KEY_LEN} bytes, got {0}")]
     Length(usize),
     #[error("key generation failed: {0}")]
-    Generate(#[from] snow::Error),
+    Generate(getrandom::Error),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PublicKey([u8; KEY_LEN]);
 
-#[derive(Clone)]
+/// Wiped from memory on drop. Copies handed to snow are not: snow keeps its
+/// own key material and doesn't zeroize it.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PrivateKey([u8; KEY_LEN]);
 
 pub struct KeyPair {
@@ -34,21 +34,19 @@ pub struct KeyPair {
 
 impl KeyPair {
     pub fn generate() -> Result<Self, KeyError> {
-        let kp = snow::Builder::new(NOISE_PARAMS.parse()?).generate_keypair()?;
-        Ok(Self {
-            private: PrivateKey(to_array(&kp.private)?),
-            public: PublicKey(to_array(&kp.public)?),
-        })
+        let mut private = PrivateKey([0; KEY_LEN]);
+        getrandom::fill(&mut private.0).map_err(KeyError::Generate)?;
+        let public = private.public_key();
+        Ok(Self { private, public })
     }
 }
 
 impl PrivateKey {
+    /// X25519 base-point multiplication, clamping the scalar as RFC 7748
+    /// requires (the same thing snow does when it uses the key).
     pub fn public_key(&self) -> PublicKey {
-        let mut dh = DefaultResolver
-            .resolve_dh(&DHChoice::Curve25519)
-            .expect("default resolver supports Curve25519");
-        dh.set(&self.0);
-        PublicKey(to_array(dh.pubkey()).expect("Curve25519 public keys are 32 bytes"))
+        let scalar = Zeroizing::new(self.0);
+        PublicKey(MontgomeryPoint::mul_base_clamped(*scalar).to_bytes())
     }
 }
 
@@ -76,7 +74,8 @@ macro_rules! key_impls {
             type Err = KeyError;
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
-                Ok(Self(to_array(&STANDARD.decode(s.trim())?)?))
+                let bytes = Zeroizing::new(STANDARD.decode(s.trim())?);
+                Ok(Self(to_array(&bytes)?))
             }
         }
     };
@@ -115,6 +114,32 @@ mod tests {
     fn derives_public_from_private() {
         let kp = KeyPair::generate().unwrap();
         assert_eq!(kp.private.public_key(), kp.public);
+    }
+
+    #[test]
+    fn matches_rfc7748_test_vector() {
+        // RFC 7748 section 6.1, Alice.
+        let private: [u8; 32] =
+            hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let public = hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        assert_eq!(PrivateKey(private).public_key().as_bytes(), &public);
+    }
+
+    fn hex(s: &str) -> [u8; 32] {
+        let v: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect();
+        v.try_into().unwrap()
+    }
+
+    #[test]
+    fn private_key_wipes_itself() {
+        fn wiped_on_drop<T: ZeroizeOnDrop>() {}
+        wiped_on_drop::<PrivateKey>();
+        let mut k = KeyPair::generate().unwrap().private;
+        k.zeroize();
+        assert_eq!(k.as_bytes(), &[0; KEY_LEN]);
     }
 
     #[test]

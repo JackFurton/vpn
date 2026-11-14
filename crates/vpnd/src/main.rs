@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
             println!("public:  {}", kp.public.to_base64());
         }
         Command::Pubkey => {
-            let mut line = String::new();
+            let mut line = zeroize::Zeroizing::new(String::new());
             std::io::stdin().read_line(&mut line)?;
             let private: PrivateKey = line.parse().context("parsing private key")?;
             println!("{}", private.public_key().to_base64());
