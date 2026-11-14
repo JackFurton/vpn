@@ -40,11 +40,11 @@ pub async fn up(
     let tun = Tun::create(interface, &iface.addresses, iface.mtu)
         .context("creating TUN device (needs root or CAP_NET_ADMIN)")?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let installed = crate::routes::apply(&routes, tun.name())
+    let mut installed = crate::routes::apply(&routes, tun.name())
         .await
         .context("installing routes")?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let installed = crate::routes::Installed::default();
+    let mut installed = crate::routes::Installed::default();
 
     tracing::info!(
         interface = tun.name(),
@@ -72,7 +72,8 @@ pub async fn up(
     // Tearing the interface down on exit only needs the fd closed.
     let dns = crate::dns::apply(&iface.dns, tun.name())?;
     crate::privdrop::drop_privileges(user)?;
-    let result = event_loop::run(device, &tun, &udp, mtu, metrics, shutdown).await;
+    let on_endpoints = |eps| installed.update_endpoints(eps);
+    let result = event_loop::run(device, &tun, &udp, mtu, metrics, on_endpoints, shutdown).await;
     installed.remove();
     dns.remove();
     result?;

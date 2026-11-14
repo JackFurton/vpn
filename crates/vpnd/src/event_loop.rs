@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -35,13 +36,15 @@ impl PacketDevice for Tun {
     }
 }
 
-/// Runs until `shutdown` resolves or the TUN device fails.
+/// Runs until `shutdown` resolves or the TUN device fails. `on_endpoints`
+/// gets every peer endpoint whenever one moves.
 pub async fn run(
     mut device: Device,
     tun: &impl PacketDevice,
     udp: &Udp,
     mtu: usize,
     metrics: Option<watch::Sender<String>>,
+    mut on_endpoints: impl FnMut(Vec<IpAddr>),
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let mut last_publish: Option<Instant> = None;
@@ -77,6 +80,12 @@ pub async fn run(
                 }
             }
             () = &mut shutdown => return Ok(()),
+        }
+
+        // Before sending: a reply to a peer's new address needs its route
+        // in place (macOS full tunnel), or it loops into the tunnel.
+        if device.take_endpoints_changed() {
+            on_endpoints(device.endpoints().map(|e| e.ip()).collect());
         }
 
         for (dest, bytes) in out.iter() {
@@ -146,7 +155,7 @@ mod tests {
                 from_kernel: Mutex::new(from_kernel),
                 to_kernel,
             };
-            run(device, &tun, &udp, 1420, None, async {
+            run(device, &tun, &udp, 1420, None, |_| {}, async {
                 let _ = stopped.await;
             })
             .await
