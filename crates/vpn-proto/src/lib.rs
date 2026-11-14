@@ -4,6 +4,7 @@
 pub mod handshake;
 pub mod keys;
 pub mod replay;
+pub mod session;
 pub mod wire;
 
 /// Same primitives WireGuard uses. Changing this breaks wire compatibility.

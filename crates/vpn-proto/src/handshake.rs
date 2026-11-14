@@ -9,10 +9,11 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use snow::params::NoiseParams;
-use snow::{Builder, HandshakeState, StatelessTransportState};
+use snow::{Builder, HandshakeState};
 
 use crate::NOISE_PARAMS;
 use crate::keys::{KEY_LEN, PrivateKey, PublicKey};
+use crate::session::{Role, Session};
 use crate::wire::{
     HANDSHAKE_INIT_LEN, HANDSHAKE_INIT_NOISE_LEN, HANDSHAKE_RESPONSE_LEN,
     HANDSHAKE_RESPONSE_NOISE_LEN, HandshakeInit, HandshakeResponse, MAC_LEN, Message,
@@ -63,23 +64,6 @@ impl Tai64N {
             .unwrap_or_default();
         Self::from_unix(d.as_secs(), d.subsec_nanos())
     }
-}
-
-/// Keys and indices for an established session. Transport encryption on top
-/// of this is #4.
-pub struct Session {
-    /// Index we chose. Peers address packets to us with it.
-    pub local_index: u32,
-    /// Index the peer chose. We address packets to them with it.
-    pub remote_index: u32,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only tests read it until transport encryption exists"
-        )
-    )]
-    pub(crate) transport: StatelessTransportState,
 }
 
 fn builder(local: &PrivateKey) -> Result<Builder<'_>, snow::Error> {
@@ -140,11 +124,12 @@ impl Initiator {
         if n != 0 {
             return Err(HandshakeError::BadPayload(n));
         }
-        Ok(Session {
-            local_index: self.sender_index,
-            remote_index: msg.sender_index,
-            transport: self.state.into_stateless_transport_mode()?,
-        })
+        Ok(Session::new(
+            self.sender_index,
+            msg.sender_index,
+            self.state.into_stateless_transport_mode()?,
+            Role::Initiator,
+        ))
     }
 }
 
@@ -213,11 +198,12 @@ impl InitReceived {
         })
         .encode(out)
         .expect("buffer is exactly HANDSHAKE_RESPONSE_LEN");
-        Ok(Session {
-            local_index: sender_index,
-            remote_index: self.initiator_index,
-            transport: self.state.into_stateless_transport_mode()?,
-        })
+        Ok(Session::new(
+            sender_index,
+            self.initiator_index,
+            self.state.into_stateless_transport_mode()?,
+            Role::Responder,
+        ))
     }
 }
 
