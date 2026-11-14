@@ -91,10 +91,10 @@ if [ "$(uname)" = Darwin ]; then
   # Replies arrive from the new address; later pings are lost, since nothing
   # on the real network answers 198.18.0.1.
   ping -c 2 192.0.2.1 || true
-  grep -q "endpoint route added.*ep=198.18.0.1" "$WORK/vpnd.log"
   via=$(route -n get 198.18.0.1 | awk '/interface:/ { print $2 }')
   echo "198.18.0.1 goes out $via"
   [ -n "$via" ] && [ "$via" != "$IFACE" ]
+  grep -q "endpoint route added.*ep=198.18.0.1" "$WORK/vpnd.log"
   stop_client
   pfctl -a com.apple/vpnd-test -F all 2>/dev/null
   pfctl -X "$PF_TOKEN" 2>/dev/null
