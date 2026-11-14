@@ -16,6 +16,11 @@ pub const HANDSHAKE_RESPONSE_NOISE_LEN: usize = 48;
 pub const HANDSHAKE_RESPONSE_LEN: usize =
     HEADER_LEN + 2 * INDEX_LEN + HANDSHAKE_RESPONSE_NOISE_LEN + 2 * MAC_LEN;
 
+pub const COOKIE_LEN: usize = 16;
+pub const COOKIE_NONCE_LEN: usize = 24;
+pub const COOKIE_REPLY_LEN: usize =
+    HEADER_LEN + INDEX_LEN + COOKIE_NONCE_LEN + COOKIE_LEN + TAG_LEN;
+
 pub const DATA_HEADER_LEN: usize = HEADER_LEN + INDEX_LEN + 8;
 /// A keepalive: header plus the tag over an empty payload.
 pub const DATA_MIN_LEN: usize = DATA_HEADER_LEN + TAG_LEN;
@@ -23,12 +28,14 @@ pub const DATA_MIN_LEN: usize = DATA_HEADER_LEN + TAG_LEN;
 const _: () = assert!(HANDSHAKE_INIT_LEN == 148);
 const _: () = assert!(HANDSHAKE_RESPONSE_LEN == 92);
 const _: () = assert!(DATA_MIN_LEN == 32);
+const _: () = assert!(COOKIE_REPLY_LEN == 64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
     HandshakeInit = 1,
     HandshakeResponse = 2,
+    CookieReply = 3,
     Data = 4,
 }
 
@@ -55,6 +62,7 @@ pub struct BufferTooSmall {
 pub enum Message<'a> {
     HandshakeInit(HandshakeInit<'a>),
     HandshakeResponse(HandshakeResponse<'a>),
+    CookieReply(CookieReply<'a>),
     Data(Data<'a>),
 }
 
@@ -76,6 +84,16 @@ pub struct HandshakeResponse<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CookieReply<'a> {
+    /// The `sender_index` of the handshake message this answers.
+    pub receiver_index: u32,
+    pub nonce: &'a [u8; COOKIE_NONCE_LEN],
+    /// Encrypted cookie, followed by its tag.
+    pub cookie: &'a [u8; COOKIE_LEN],
+    pub tag: &'a [u8; TAG_LEN],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Data<'a> {
     pub receiver_index: u32,
     pub counter: u64,
@@ -91,6 +109,7 @@ impl<'a> Message<'a> {
         let message = match header[0] {
             1 => MessageType::HandshakeInit,
             2 => MessageType::HandshakeResponse,
+            3 => MessageType::CookieReply,
             4 => MessageType::Data,
             other => return Err(ParseError::UnknownType(other)),
         };
@@ -121,6 +140,14 @@ impl<'a> Message<'a> {
                     mac2: r.array(),
                 })
             }
+            MessageType::CookieReply if buf.len() == COOKIE_REPLY_LEN => {
+                Message::CookieReply(CookieReply {
+                    receiver_index: r.u32(),
+                    nonce: r.array(),
+                    cookie: r.array(),
+                    tag: r.array(),
+                })
+            }
             MessageType::Data if buf.len() >= DATA_MIN_LEN => Message::Data(Data {
                 receiver_index: r.u32(),
                 counter: r.u64(),
@@ -135,6 +162,7 @@ impl<'a> Message<'a> {
         match self {
             Message::HandshakeInit(_) => HANDSHAKE_INIT_LEN,
             Message::HandshakeResponse(_) => HANDSHAKE_RESPONSE_LEN,
+            Message::CookieReply(_) => COOKIE_REPLY_LEN,
             Message::Data(d) => DATA_HEADER_LEN + d.ciphertext.len(),
         }
     }
@@ -162,6 +190,13 @@ impl<'a> Message<'a> {
                 w.put(m.noise);
                 w.put(m.mac1);
                 w.put(m.mac2);
+            }
+            Message::CookieReply(m) => {
+                w.header(MessageType::CookieReply);
+                w.put(&m.receiver_index.to_le_bytes());
+                w.put(m.nonce);
+                w.put(m.cookie);
+                w.put(m.tag);
             }
             Message::Data(m) => {
                 encode_data_header(m.receiver_index, m.counter, w.take());
@@ -236,8 +271,10 @@ mod tests {
     const MAC1: [u8; MAC_LEN] = [0x11; MAC_LEN];
     const MAC2: [u8; MAC_LEN] = [0x22; MAC_LEN];
     const CIPHERTEXT: [u8; 48] = [0xcc; 48];
+    const NONCE: [u8; COOKIE_NONCE_LEN] = [0x33; COOKIE_NONCE_LEN];
+    const COOKIE: [u8; COOKIE_LEN] = [0x44; COOKIE_LEN];
 
-    fn samples() -> [Message<'static>; 3] {
+    fn samples() -> [Message<'static>; 4] {
         [
             Message::HandshakeInit(HandshakeInit {
                 sender_index: 0xdead_beef,
@@ -257,6 +294,12 @@ mod tests {
                 counter: u64::MAX - 1,
                 ciphertext: &CIPHERTEXT,
             }),
+            Message::CookieReply(CookieReply {
+                receiver_index: 0xdead_beef,
+                nonce: &NONCE,
+                cookie: &COOKIE,
+                tag: &MAC1,
+            }),
         ]
     }
 
@@ -275,7 +318,7 @@ mod tests {
 
     #[test]
     fn fields_are_little_endian_at_spec_offsets() {
-        let [init, _, data] = samples();
+        let [init, _, data, _] = samples();
         let init = encode(&init);
         assert_eq!(init[..8], [1, 0, 0, 0, 0xef, 0xbe, 0xad, 0xde]);
         assert_eq!(init[8..116], NOISE1);
@@ -289,7 +332,7 @@ mod tests {
 
     #[test]
     fn rejects_truncated_and_oversized_handshakes() {
-        for m in &samples()[..2] {
+        for m in [&samples()[0], &samples()[1], &samples()[3]] {
             let buf = encode(m);
             let mut long = buf.clone();
             long.push(0);
@@ -324,7 +367,7 @@ mod tests {
     fn rejects_bad_headers() {
         assert_eq!(Message::parse(&[]), Err(ParseError::Truncated));
         assert_eq!(Message::parse(&[4, 0, 0]), Err(ParseError::Truncated));
-        for t in [0, 3, 5, 255] {
+        for t in [0, 5, 255] {
             assert_eq!(
                 Message::parse(&[t, 0, 0, 0]),
                 Err(ParseError::UnknownType(t))
