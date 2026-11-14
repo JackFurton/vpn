@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 use vpn_proto::ip::IpHeader;
@@ -51,6 +52,7 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     match Cli::parse().command {

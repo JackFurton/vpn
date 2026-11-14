@@ -1578,6 +1578,7 @@ dependencies = [
  "clap",
  "ipnet",
  "serde",
+ "socket2",
  "thiserror",
  "tokio",
  "toml",
