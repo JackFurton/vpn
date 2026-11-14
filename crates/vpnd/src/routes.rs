@@ -178,7 +178,7 @@ mod macos {
         }
 
         pub fn update_endpoints(&mut self, endpoints: Vec<IpAddr>) {
-            if true || !self.pinning {
+            if !self.pinning {
                 return;
             }
             let mut rm = match RouteManager::new() {
