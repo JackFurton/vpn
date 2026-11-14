@@ -1,16 +1,15 @@
 //! `vpnd up`: config in, running tunnel out.
 
 use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::net::UdpSocket;
 use vpn_proto::device::{Device, PeerConfig};
 
 use crate::config::Config;
 use crate::event_loop;
 use crate::tun::Tun;
+use crate::udp::Udp;
 
 pub async fn up(
     config: Config,
@@ -32,12 +31,8 @@ pub async fn up(
         });
     }
 
-    // IPv4 only for now: a dual-stack socket needs v4-mapped endpoint
-    // handling, and the IPV6_V6ONLY default differs between Linux and macOS.
-    let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, iface.listen_port.unwrap_or(0)));
-    let udp = UdpSocket::bind(bind)
-        .await
-        .with_context(|| format!("binding UDP {bind}"))?;
+    let port = iface.listen_port.unwrap_or(0);
+    let udp = Udp::bind(port).with_context(|| format!("binding UDP port {port}"))?;
     let tun = Tun::create(interface, &iface.addresses, iface.mtu)
         .context("creating TUN device (needs root or CAP_NET_ADMIN)")?;
 

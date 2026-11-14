@@ -5,11 +5,11 @@ use std::future::Future;
 use std::io;
 use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
 use vpn_proto::device::{Dest, Device, Outbox};
 
 use crate::tun::Tun;
+use crate::udp::Udp;
 
 /// Retries are on a 5s scale; 250ms keeps them within a tick of on time.
 const TICK: Duration = Duration::from_millis(250);
@@ -36,7 +36,7 @@ impl PacketDevice for Tun {
 pub async fn run(
     mut device: Device,
     tun: &impl PacketDevice,
-    udp: &UdpSocket,
+    udp: &Udp,
     mtu: usize,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
@@ -85,6 +85,8 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use tokio::sync::{Mutex, mpsc, oneshot};
     use vpn_proto::device::PeerConfig;
     use vpn_proto::keys::KeyPair;
@@ -121,7 +123,7 @@ mod tests {
         task: tokio::task::JoinHandle<io::Result<()>>,
     }
 
-    fn spawn(device: Device, udp: UdpSocket) -> Side {
+    fn spawn(device: Device, udp: Udp) -> Side {
         let (inject, from_kernel) = mpsc::channel(16);
         let (to_kernel, delivered) = mpsc::channel(16);
         let (stop, stopped) = oneshot::channel();
@@ -164,13 +166,14 @@ mod tests {
     #[tokio::test]
     async fn forwards_both_directions_over_real_udp() {
         let (ka, kb) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
-        let udp_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let udp_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_a = Udp::bind(0).unwrap();
+        let udp_b = Udp::bind(0).unwrap();
+        let b_port = udp_b.local_addr().unwrap().port();
 
         let mut a = Device::new(ka.private, 1420);
         a.add_peer(PeerConfig {
             public_key: kb.public,
-            endpoint: Some(udp_b.local_addr().unwrap()),
+            endpoint: Some(SocketAddr::from(([127, 0, 0, 1], b_port))),
             allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
             persistent_keepalive: None,
         });
