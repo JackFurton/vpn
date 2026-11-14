@@ -100,6 +100,11 @@ ip netns exec vpn-c ping -c 3 -W 2 10.8.0.1
 echo "== ping a -> c"
 ip netns exec vpn-a ping -c 3 -W 2 10.8.0.3
 grep -q 'listen=\[::\]:51820' "$WORK/a.log" || { echo "server isn't dual-stack"; exit 1; }
+# b and c both route 10.8.0.0/24 to a. With forwarding on, a's kernel sends
+# b's packet for c straight back into tun0, and a's Device routes it to c.
+echo "== ping b -> c through the server"
+ip netns exec vpn-a sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+ip netns exec vpn-b ping -c 3 -W 2 10.8.0.3
 echo "== full-MTU ping with DF set"
 ip netns exec vpn-b ping -c 2 -W 2 -M do -s 1392 10.8.0.1
 # Over IPv6 the outer overhead is 80 bytes, so 1420 + 80 fills the 1500-byte

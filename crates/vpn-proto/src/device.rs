@@ -4,7 +4,7 @@
 //!
 //! Session lifetimes and timers follow WireGuard (whitepaper section 6).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -329,6 +329,17 @@ impl Peer {
         })
     }
 
+    fn pending_index(&self) -> Option<u32> {
+        self.attempt
+            .as_ref()
+            .and_then(|a| a.initiator.as_ref())
+            .map(Initiator::sender_index)
+    }
+
+    fn owns_index(&self, index: u32) -> bool {
+        self.find(index).is_some() || self.pending_index() == Some(index)
+    }
+
     fn mark_sent(&mut self, now: Instant, data: bool) {
         self.last_sent = Some(now);
         self.owe_keepalive = None;
@@ -365,6 +376,12 @@ pub struct Device {
     cookie_replies_sent: u64,
     /// Every peer's allowed_ips, to peer index.
     routes: AllowedIps<usize>,
+    /// Peer by static key, for initiations.
+    by_key: HashMap<PublicKey, usize>,
+    /// Peer by an index we chose (live session or in-flight initiation), so
+    /// an incoming datagram finds its peer without scanning them all.
+    /// Entries go stale when sessions expire and `tick` sweeps them.
+    by_index: HashMap<u32, usize>,
 }
 
 impl Device {
@@ -383,13 +400,17 @@ impl Device {
             drops: Drops::default(),
             cookie_replies_sent: 0,
             routes: AllowedIps::new(),
+            by_key: HashMap::new(),
+            by_index: HashMap::new(),
         }
     }
 
     pub fn add_peer(&mut self, c: PeerConfig) {
+        let i = self.peers.len();
         for net in &c.allowed_ips {
-            self.routes.insert(*net, self.peers.len());
+            self.routes.insert(*net, i);
         }
+        self.by_key.insert(c.public_key.clone(), i);
         self.peers.push(Peer {
             keys: MacKeys::new(&c.public_key),
             cookie: None,
@@ -560,6 +581,10 @@ impl Device {
                 }
             }
         }
+        // Last, so sessions this tick expired are already gone.
+        let peers = &self.peers;
+        self.by_index
+            .retain(|&index, &mut i| peers[i].owns_index(index));
     }
 
     fn route(&self, dst: IpAddr) -> Option<usize> {
@@ -625,6 +650,7 @@ impl Device {
             private,
             peers,
             drops,
+            by_index,
             ..
         } = self;
         let peer = &mut peers[i];
@@ -658,6 +684,9 @@ impl Device {
         }
         // Record the attempt even on failure so `tick` retries instead of
         // every outbound packet trying again immediately.
+        if initiator.is_some() {
+            by_index.insert(index, i);
+        }
         peer.attempt = Some(Attempt {
             initiator,
             first_sent,
@@ -687,16 +716,12 @@ impl Device {
     }
 
     fn on_cookie_reply(&mut self, c: &CookieReply, now: Instant) {
-        let Some(peer) = self.peers.iter_mut().find(|p| {
-            p.attempt
-                .as_ref()
-                .and_then(|a| a.initiator.as_ref())
-                .is_some_and(|x| x.sender_index() == c.receiver_index)
-        }) else {
+        let Some(i) = self.pending_peer(c.receiver_index) else {
             trace!("cookie reply for no pending handshake");
             self.drops.add(DropReason::BadCookieReply, 1);
             return;
         };
+        let peer = &mut self.peers[i];
         let sent_mac1 = peer.attempt.as_ref().expect("found above").sent_mac1;
         match peer.keys.open_reply(c, &sent_mac1) {
             // Don't resend now: the retry timer does, so a flood of cookie
@@ -712,17 +737,21 @@ impl Device {
     fn fresh_index(&self) -> u32 {
         loop {
             let candidate = getrandom::u32().expect("OS random source failed");
-            let in_use = self.peers.iter().any(|p| {
-                p.find(candidate).is_some()
-                    || p.attempt
-                        .as_ref()
-                        .and_then(|a| a.initiator.as_ref())
-                        .is_some_and(|x| x.sender_index() == candidate)
-            });
-            if !in_use {
+            // Stale entries count as taken until the next sweep, which only
+            // makes this more conservative.
+            if !self.by_index.contains_key(&candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// The peer whose in-flight initiation used `index`.
+    fn pending_peer(&self, index: u32) -> Option<usize> {
+        let &i = self.by_index.get(&index)?;
+        self.peers[i]
+            .pending_index()
+            .is_some_and(|x| x == index)
+            .then_some(i)
     }
 
     fn on_init(&mut self, m: &HandshakeInit, from: SocketAddr, now: Instant, out: &mut Outbox) {
@@ -734,11 +763,7 @@ impl Device {
                 return;
             }
         };
-        let Some(i) = self
-            .peers
-            .iter()
-            .position(|p| &p.public_key == received.peer())
-        else {
+        let Some(&i) = self.by_key.get(received.peer()) else {
             debug!(%from, peer = ?received.peer(), "initiation from unknown key");
             self.drops.add(DropReason::UnknownPeer, 1);
             return;
@@ -752,6 +777,7 @@ impl Device {
                 // The initiation proved the sender holds the peer's key and
                 // the timestamp proved it's fresh, so this is where it lives now.
                 peer.endpoint = Some(from);
+                self.by_index.insert(index, i);
                 peer.next = Some(Slot {
                     session,
                     born: now,
@@ -773,12 +799,7 @@ impl Device {
         now: Instant,
         out: &mut Outbox,
     ) {
-        let Some(i) = self.peers.iter().position(|p| {
-            p.attempt
-                .as_ref()
-                .and_then(|a| a.initiator.as_ref())
-                .is_some_and(|x| x.sender_index() == m.receiver_index)
-        }) else {
+        let Some(i) = self.pending_peer(m.receiver_index) else {
             trace!(%from, "response for no pending handshake");
             self.drops.add(DropReason::UnmatchedResponse, 1);
             return;
@@ -810,12 +831,11 @@ impl Device {
     }
 
     fn on_data(&mut self, d: &Data, from: SocketAddr, now: Instant, out: &mut Outbox) {
-        let Some((i, which)) = self
-            .peers
-            .iter()
-            .enumerate()
-            .find_map(|(i, p)| p.find(d.receiver_index).map(|w| (i, w)))
-        else {
+        let found = self
+            .by_index
+            .get(&d.receiver_index)
+            .and_then(|&i| self.peers[i].find(d.receiver_index).map(|w| (i, w)));
+        let Some((i, which)) = found else {
             trace!(index = d.receiver_index, "data for unknown session");
             self.drops.add(DropReason::UnknownSession, 1);
             return;
@@ -1495,5 +1515,21 @@ mod tests {
             net.a.stats(net.now).peers[0].since_handshake,
             Some(Duration::from_secs(7))
         );
+    }
+
+    #[test]
+    fn index_table_tracks_live_sessions_only() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        // A: the session it initiated. B: the session it accepted.
+        assert_eq!(net.a.by_index.len(), 1);
+        assert_eq!(net.b.by_index.len(), 1);
+
+        net.now += REKEY_AFTER_TIME;
+        net.send_a(&to_b(2));
+        assert_eq!(net.a.by_index.len(), 2, "current and previous");
+
+        net.tick_a(REJECT_AFTER_TIME);
+        assert!(net.a.by_index.is_empty(), "expired sessions swept");
     }
 }
