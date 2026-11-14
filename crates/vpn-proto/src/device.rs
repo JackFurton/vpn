@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 use ipnet::IpNet;
 use tracing::{debug, trace};
 
+use crate::cookie::{COOKIE_USE_LIFETIME, Cookie, CookieJar, MacKeys};
 use crate::handshake::{HandshakeError, InitReceived, Initiator, Tai64N, read_init};
 use crate::ip::IpHeader;
 use crate::keys::{PrivateKey, PublicKey};
 use crate::session::{Session, TransportError};
 use crate::wire::{
-    DATA_MIN_LEN, Data, HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, HandshakeInit,
-    HandshakeResponse, Message, TAG_LEN,
+    COOKIE_REPLY_LEN, CookieReply, DATA_MIN_LEN, Data, HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN,
+    HandshakeInit, HandshakeResponse, Message, TAG_LEN,
 };
 
 /// Start a new handshake once a session has carried this many messages.
@@ -35,6 +36,12 @@ pub const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Packets held per peer while a handshake is in flight.
 pub const MAX_QUEUED: usize = 128;
+/// Past this many valid initiations in one second we're under load, and
+/// demand a cookie (mac2) before spending DH on an initiation. Each costs the
+/// responder four X25519 operations, so this is far below what one core can
+/// do; the point is to stop a flood before it gets anywhere near that.
+pub const UNDER_LOAD_INITS_PER_SEC: u32 = 128;
+const LOAD_WINDOW: Duration = Duration::from_secs(1);
 
 /// If we sent data and heard nothing back for this long, the peer probably
 /// lost our session (a restart, say), so start a new one. Longer than
@@ -126,6 +133,8 @@ struct Attempt {
     initiator: Option<Initiator>,
     first_sent: Instant,
     last_sent: Instant,
+    /// mac1 of the last initiation sent. A cookie reply is bound to it.
+    sent_mac1: [u8; 16],
 }
 
 /// A session plus the timing the device needs to retire it.
@@ -174,6 +183,10 @@ struct Peer {
     awaiting_reply: Option<Instant>,
     /// First data we received since we last sent anything.
     owe_keepalive: Option<Instant>,
+    /// For stamping mac1 on what we send this peer.
+    keys: MacKeys,
+    /// Cookie the peer gave us while under load, and when.
+    cookie: Option<(Cookie, Instant)>,
 }
 
 impl Peer {
@@ -221,21 +234,34 @@ impl Peer {
 
 pub struct Device {
     private: PrivateKey,
+    /// For checking mac1 on what peers send us.
+    keys: MacKeys,
     mtu: usize,
     peers: Vec<Peer>,
+    jar: Option<CookieJar>,
+    load_window: Option<(Instant, u32)>,
+    under_load_until: Option<Instant>,
+    pub(crate) load_threshold: u32,
 }
 
 impl Device {
     pub fn new(private: PrivateKey, mtu: usize) -> Self {
         Self {
+            keys: MacKeys::new(&private.public_key()),
             private,
             mtu,
             peers: Vec::new(),
+            jar: None,
+            load_window: None,
+            under_load_until: None,
+            load_threshold: UNDER_LOAD_INITS_PER_SEC,
         }
     }
 
     pub fn add_peer(&mut self, c: PeerConfig) {
         self.peers.push(Peer {
+            keys: MacKeys::new(&c.public_key),
+            cookie: None,
             public_key: c.public_key,
             endpoint: c.endpoint,
             allowed_ips: c.allowed_ips,
@@ -276,8 +302,27 @@ impl Device {
         out: &mut Outbox,
     ) {
         match Message::parse(datagram) {
-            Ok(Message::HandshakeInit(m)) => self.on_init(&m, from, now, out),
+            // mac1 is one cheap hash, so junk dies here before any DH.
+            Ok(Message::HandshakeInit(_) | Message::HandshakeResponse(_))
+                if !self.keys.verify_mac1(datagram) =>
+            {
+                trace!(%from, "dropping handshake message with bad mac1");
+            }
+            Ok(Message::HandshakeInit(m)) => {
+                if self.under_load(now) && !self.jar(now).verify_mac2(datagram, from, now) {
+                    debug!(%from, "under load, replying with a cookie");
+                    let jar = self.jar.as_mut().expect("created above");
+                    let _ = out.push(Dest::Udp(from), COOKIE_REPLY_LEN, |b| {
+                        let b = b.try_into().expect("push reserved exactly this many bytes");
+                        jar.reply(datagram, m.sender_index, from, now, b);
+                        Ok::<_, ()>(COOKIE_REPLY_LEN)
+                    });
+                    return;
+                }
+                self.on_init(&m, from, now, out);
+            }
             Ok(Message::HandshakeResponse(m)) => self.on_response(&m, from, now, out),
+            Ok(Message::CookieReply(c)) => self.on_cookie_reply(&c, now),
             Ok(Message::Data(d)) => self.on_data(&d, now, out),
             Err(e) => trace!(%from, %e, "dropping datagram"),
         }
@@ -412,16 +457,22 @@ impl Device {
             return;
         };
         let first_sent = peer.attempt.as_ref().map_or(now, |a| a.first_sent);
+        let cookie = peer
+            .cookie
+            .filter(|(_, at)| now.saturating_duration_since(*at) < COOKIE_USE_LIFETIME)
+            .map(|(c, _)| c);
         let mut initiator = None;
+        let mut sent_mac1 = [0; 16];
         let res = out.push(Dest::Udp(ep), HANDSHAKE_INIT_LEN, |b| {
-            let b = b.try_into().expect("push reserved exactly this many bytes");
+            let msg = b.try_into().expect("push reserved exactly this many bytes");
             initiator = Some(Initiator::start(
                 private,
                 &peer.public_key,
                 index,
                 Tai64N::now(),
-                b,
+                msg,
             )?);
+            sent_mac1 = peer.keys.stamp(b, cookie.as_ref());
             Ok::<_, HandshakeError>(HANDSHAKE_INIT_LEN)
         });
         if let Err(e) = res {
@@ -433,7 +484,47 @@ impl Device {
             initiator,
             first_sent,
             last_sent: now,
+            sent_mac1,
         });
+    }
+
+    fn jar(&mut self, now: Instant) -> &mut CookieJar {
+        let keys = &self.keys;
+        self.jar.get_or_insert_with(|| CookieJar::new(keys, now))
+    }
+
+    /// Counts one mac1-valid initiation and says whether we're under load.
+    fn under_load(&mut self, now: Instant) -> bool {
+        let (start, count) = match self.load_window {
+            Some((start, count)) if now.saturating_duration_since(start) < LOAD_WINDOW => {
+                (start, count + 1)
+            }
+            _ => (now, 1),
+        };
+        self.load_window = Some((start, count));
+        if count > self.load_threshold {
+            self.under_load_until = Some(now + LOAD_WINDOW);
+        }
+        self.under_load_until.is_some_and(|t| now < t)
+    }
+
+    fn on_cookie_reply(&mut self, c: &CookieReply, now: Instant) {
+        let Some(peer) = self.peers.iter_mut().find(|p| {
+            p.attempt
+                .as_ref()
+                .and_then(|a| a.initiator.as_ref())
+                .is_some_and(|x| x.sender_index() == c.receiver_index)
+        }) else {
+            trace!("cookie reply for no pending handshake");
+            return;
+        };
+        let sent_mac1 = peer.attempt.as_ref().expect("found above").sent_mac1;
+        match peer.keys.open_reply(c, &sent_mac1) {
+            // Don't resend now: the retry timer does, so a flood of cookie
+            // replies can't make us flood initiations.
+            Some(cookie) => peer.cookie = Some((cookie, now)),
+            None => debug!(peer = ?peer.public_key, "dropping cookie reply that didn't open"),
+        }
     }
 
     fn fresh_index(&self) -> u32 {
@@ -471,7 +562,7 @@ impl Device {
         let index = self.fresh_index();
         let peer = &mut self.peers[i];
         let timestamp = received.timestamp();
-        match respond(received, peer.last_init, index, from, out) {
+        match respond(received, peer.last_init, index, &peer.keys, from, out) {
             Ok(session) => {
                 peer.last_init = Some(timestamp);
                 // The initiation proved the sender holds the peer's key and
@@ -594,13 +685,15 @@ fn respond(
     received: InitReceived,
     last_init: Option<Tai64N>,
     index: u32,
+    keys: &MacKeys,
     to: SocketAddr,
     out: &mut Outbox,
 ) -> Result<Session, HandshakeError> {
     let mut session = None;
     out.push(Dest::Udp(to), HANDSHAKE_RESPONSE_LEN, |b| {
-        let b = b.try_into().expect("push reserved exactly this many bytes");
-        session = Some(received.accept(last_init, index, b)?);
+        let msg = b.try_into().expect("push reserved exactly this many bytes");
+        session = Some(received.accept(last_init, index, msg)?);
+        keys.stamp(b, None);
         Ok::<_, HandshakeError>(HANDSHAKE_RESPONSE_LEN)
     })?;
     Ok(session.expect("set on success"))
@@ -1033,5 +1126,46 @@ mod tests {
         assert_eq!(net.sent.len(), 3);
         net.tick_a(Duration::from_secs(1));
         assert_eq!(net.sent, [1, 2, 4, 4]);
+    }
+
+    #[test]
+    fn drops_initiation_with_bad_mac1() {
+        let mut net = Net::new();
+        let mut out = Outbox::new();
+        net.a.initiate(0, net.now, &mut out);
+        let (_, bytes) = out.iter().next().unwrap();
+        let mut forged = bytes.to_vec();
+        forged[HANDSHAKE_INIT_LEN - 20] ^= 1;
+        let mut reply = Outbox::new();
+        net.b.handle_udp(&forged, A, net.now, &mut reply);
+        assert!(reply.is_empty());
+        assert!(net.b.peers[0].next.is_none());
+    }
+
+    #[test]
+    fn under_load_demands_a_cookie_first() {
+        let mut net = Net::new();
+        net.b.load_threshold = 0;
+        let (_, at_b) = net.send_a(&to_b(1));
+        assert!(at_b.is_empty());
+        assert_eq!(net.sent, [1, 3], "cookie reply instead of a response");
+        assert!(net.a.peers[0].cookie.is_some());
+
+        // The retry carries mac2, so B does the DH even though still loaded.
+        let (_, at_b) = net.tick_a(REKEY_TIMEOUT);
+        assert_eq!(at_b, vec![to_b(1)]);
+        assert_eq!(net.sent, [1, 3, 1, 2, 4]);
+    }
+
+    #[test]
+    fn load_window_resets() {
+        let mut net = Net::new();
+        net.b.load_threshold = 2;
+        let t = net.now;
+        assert!(!net.b.under_load(t));
+        assert!(!net.b.under_load(t));
+        assert!(net.b.under_load(t), "third in a second tips it over");
+        assert!(net.b.under_load(t + Duration::from_millis(999)));
+        assert!(!net.b.under_load(t + Duration::from_secs(2)));
     }
 }

@@ -53,7 +53,7 @@ that must be zero. A 32-bit header keeps the following fields aligned.
 |---|---|---|
 | 1 | Handshake initiation | 148 |
 | 2 | Handshake response | 92 |
-| 3 | Cookie reply | 64, reserved, defined by #12 |
+| 3 | Cookie reply | 64 |
 | 4 | Transport data | 32 + padded payload |
 
 Drop a datagram if its type is unknown, its reserved bytes aren't zero, or
@@ -97,9 +97,7 @@ one it accepted from that peer, and drops it. Without that check the attacker
 could make the responder throw away a live session. Timestamps only have to
 increase per peer, so clocks don't need to be in sync.
 
-`mac1` and `mac2` are reserved for DoS protection (#12). Until that lands,
-senders write zeros and receivers ignore both fields. They're in the layout
-from version 1 so adding them later doesn't change any sizes.
+`mac1` and `mac2` are covered in DoS protection below.
 
 ### Handshake response (type 2)
 
@@ -169,6 +167,63 @@ length field is larger than the decrypted data.
 A data message with an empty payload (32 bytes on the wire) is a keepalive.
 It keeps NAT mappings open and confirms the session is alive. Don't write it
 to the TUN device.
+
+### Cookie reply (type 3)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   type = 3    |                reserved (0)                   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        receiver_index                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+~                         nonce (24)                            ~
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    encrypted cookie (16)                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Poly1305 tag (16)                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+`receiver_index` is the `sender_index` of the initiation this answers. The
+cookie is encrypted with XChaCha20-Poly1305 under the key
+`BLAKE2s("cookie--" || responder static public key)`. The associated data
+is the initiation's mac1, so a reply only opens for the message it answers.
+
+## DoS protection
+
+A responder that processes an initiation spends four X25519 operations
+before it knows whether the sender is a real peer. Without protection,
+anyone can burn its CPU by sending initiations. The defense, from WireGuard
+section 5.4, has three layers.
+
+**mac1** goes on every handshake message:
+`BLAKE2s-128(key = BLAKE2s("mac1----" || recipient static public key), msg[..mac1])`.
+Only someone who knows the recipient's public key can compute it, and
+checking it costs one hash. A message with a bad mac1 is dropped before
+anything else happens.
+
+**Load.** A responder that has seen more than 128 initiations with a valid
+mac1 in the last second is under load, and stays that way for one second
+after the threshold is crossed.
+
+**mac2.** Under load, the responder also requires a valid mac2:
+`BLAKE2s-128(key = cookie, msg[..mac2])`. The cookie is
+`BLAKE2s-128(key = secret, source IP || source port)`, and the responder
+replaces that secret every 120 s. An initiation with a missing or wrong mac2
+gets a cookie reply and no further work. The cookie reply needs no DH, and
+at 64 bytes it's smaller than the 148-byte initiation it answers, so it
+can't be used to amplify an attack.
+
+**Initiator.** The initiator decrypts the cookie, then waits for its normal
+`REKEY_TIMEOUT` retry instead of resending right away. The retry carries
+mac2 for the next 115 s. This proves the initiator receives packets at the
+address it claims, which a flood with spoofed source addresses can't do.
+Waiting for the retry also means a flood of cookie replies can't trigger a
+flood of initiations.
 
 ## Handshake flow
 
@@ -293,4 +348,5 @@ The rules:
 - Message types 1 to 4 and their layouts mirror WireGuard on purpose, but
   that's for familiarity, not compatibility. Nothing promises they'll stay
   aligned.
-- mac1, mac2, and the cookie reply are defined in #12, not here.
+- Under load, the responder only sends cookie replies to initiations. It
+  doesn't send them to responses.
