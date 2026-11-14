@@ -2,6 +2,7 @@
 //! Nothing in this crate touches sockets or TUN devices.
 
 pub mod keys;
+pub mod replay;
 pub mod wire;
 
 /// Same primitives WireGuard uses. Changing this breaks wire compatibility.
