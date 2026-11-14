@@ -104,7 +104,8 @@ print(line)
 PY
 }
 
-echo "== TCP, one stream, ${SECS}s, b to a ($(nproc) CPUs, $(uname -r))"
+cpu=$(lscpu | sed -n "s/^Model name: *//p" | head -1)
+echo "== TCP, one stream, ${SECS}s, b to a ($(nproc) CPUs, ${cpu:-unknown CPU}, kernel $(uname -r))"
 run "veth" 172.31.0.1
 run "vpnd" 10.8.0.1
 run "kernel wireguard" 10.9.0.1

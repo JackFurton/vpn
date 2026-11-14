@@ -23,7 +23,7 @@ the quarantine flag first: `xattr -d com.apple.quarantine vpnd`.
 
 Or build it yourself: `cargo build --release -p vpnd`.
 
-Setting up a server: [docs/server-setup.md](docs/server-setup.md).
+Setting up a server: [docs/server-setup.md](docs/server-setup.md). How fast it is: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## License
 
