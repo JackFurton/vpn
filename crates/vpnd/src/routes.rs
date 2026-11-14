@@ -12,10 +12,18 @@
 //! and use the normal default route. This keeps working when the server's
 //! endpoint changes, which a /32 host route wouldn't.
 //!
-//! Every route points at the TUN device, so the kernel deletes them when the
+//! macOS has no fwmark routing, so there a default route becomes the classic
+//! split instead: 0.0.0.0/1 and 128.0.0.0/1 on the tunnel (each more specific
+//! than the real default route, which stays untouched), plus a host route
+//! for every peer endpoint via whatever reached it before. vpnd stays root on
+//! macOS and removes those on exit.
+//!
+//! On Linux every route points at the TUN device, so the kernel deletes them when the
 //! device goes away, which matters because vpnd drops the privilege to remove
 //! anything itself. The two rules can outlive vpnd, but with TABLE empty
 //! they only fall through, and the next start clears them.
+
+use std::net::IpAddr;
 
 use ipnet::IpNet;
 
@@ -30,10 +38,13 @@ pub struct Plan {
     pub routes: Vec<IpNet>,
     pub default_v4: bool,
     pub default_v6: bool,
+    /// Where peers live. On macOS these need host routes that bypass the
+    /// tunnel once it carries a default route.
+    pub endpoints: Vec<IpAddr>,
 }
 
 impl Plan {
-    pub fn needs_mark(&self) -> bool {
+    pub fn has_default(&self) -> bool {
         self.default_v4 || self.default_v6
     }
 }
@@ -56,11 +67,105 @@ pub fn plan(config: &Config) -> Plan {
             _ => p.routes.push(*net),
         }
     }
+    p.endpoints = config
+        .peers
+        .iter()
+        .filter_map(|peer| peer.endpoint.map(|e| e.ip()))
+        .collect();
     p
+}
+
+/// What `apply` changed, to undo on exit where vpnd still can.
+#[derive(Default)]
+pub struct Installed {
+    #[cfg(target_os = "macos")]
+    routes: Vec<route_manager::Route>,
 }
 
 #[cfg(target_os = "linux")]
 pub use linux::apply;
+#[cfg(target_os = "macos")]
+pub use macos::apply;
+
+impl Installed {
+    pub fn remove(self) {
+        #[cfg(target_os = "macos")]
+        macos::remove(self.routes);
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use anyhow::{Context, Result};
+    use route_manager::{Route, RouteManager};
+
+    use super::{Installed, Plan};
+
+    pub async fn apply(plan: &Plan, ifname: &str) -> Result<Installed> {
+        let mut rm = RouteManager::new().context("opening routing socket")?;
+        let mut added = Vec::new();
+        let on_tunnel = |dst: IpAddr, len: u8| Route::new(dst, len).with_if_name(ifname.to_owned());
+
+        let mut wanted: Vec<Route> = Vec::new();
+        if plan.has_default() {
+            // Pin each endpoint to its current path before the /1s capture it.
+            for &ep in &plan.endpoints {
+                let current = rm
+                    .find_route(&ep)?
+                    .with_context(|| format!("no route to endpoint {ep}"))?;
+                let len = if ep.is_ipv4() { 32 } else { 128 };
+                let mut host = Route::new(ep, len);
+                host = match (current.gateway(), current.if_name()) {
+                    (Some(gw), _) if !gw.is_unspecified() => host.with_gateway(gw),
+                    (_, Some(name)) => host.with_if_name(name.clone()),
+                    _ => continue,
+                };
+                wanted.push(host);
+            }
+        }
+        if plan.default_v4 {
+            wanted.push(on_tunnel(Ipv4Addr::new(0, 0, 0, 0).into(), 1));
+            wanted.push(on_tunnel(Ipv4Addr::new(128, 0, 0, 0).into(), 1));
+        }
+        if plan.default_v6 {
+            wanted.push(on_tunnel(Ipv6Addr::UNSPECIFIED.into(), 1));
+            wanted.push(on_tunnel(
+                Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0).into(),
+                1,
+            ));
+        }
+        wanted.extend(
+            plan.routes
+                .iter()
+                .map(|n| on_tunnel(n.network(), n.prefix_len())),
+        );
+
+        for route in wanted {
+            match rm.add(&route) {
+                Ok(()) => {
+                    tracing::info!(dst = %route.destination(), prefix = route.prefix(), "route added");
+                    added.push(route);
+                }
+                Err(e) => {
+                    tracing::warn!(dst = %route.destination(), prefix = route.prefix(), %e, "couldn't add route")
+                }
+            }
+        }
+        Ok(Installed { routes: added })
+    }
+
+    pub fn remove(routes: Vec<Route>) {
+        let Ok(mut rm) = RouteManager::new() else {
+            return;
+        };
+        for route in routes.iter().rev() {
+            // Routes on the utun device usually vanish with it already.
+            let _ = rm.delete(route);
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -78,7 +183,7 @@ mod linux {
     const SUPPRESS_PRIORITY: u32 = 32_760;
     const NOT_MARKED_PRIORITY: u32 = 32_761;
 
-    pub async fn apply(plan: &Plan, ifname: &str) -> Result<()> {
+    pub async fn apply(plan: &Plan, ifname: &str) -> Result<super::Installed> {
         let (conn, handle, _) = rtnetlink::new_connection().context("opening netlink")?;
         tokio::spawn(conn);
         let index = handle
@@ -142,7 +247,7 @@ mod linux {
             add_rules(r.table_id(TABLE).fw_mark(FWMARK), handle.rule().add().v6()).await?;
             tracing::info!(dev = ifname, "all IPv6 traffic now goes through the tunnel");
         }
-        Ok(())
+        Ok(super::Installed::default())
     }
 
     async fn add_rules<T>(
@@ -235,7 +340,7 @@ mod tests {
         );
         let p = plan(&c);
         assert_eq!(p.routes, vec!["192.168.50.0/24".parse::<IpNet>().unwrap()]);
-        assert!(!p.needs_mark());
+        assert!(!p.has_default());
     }
 
     #[test]
@@ -245,7 +350,7 @@ mod tests {
             &[&["0.0.0.0/0", "::/0"], &["172.16.0.0/12"]],
         );
         let p = plan(&c);
-        assert!(p.default_v4 && p.default_v6 && p.needs_mark());
+        assert!(p.default_v4 && p.default_v6 && p.has_default());
         assert_eq!(p.routes, vec!["172.16.0.0/12".parse::<IpNet>().unwrap()]);
     }
 }
