@@ -17,16 +17,21 @@ pub struct Udp {
 impl Udp {
     /// Binds `[::]:port` dual-stack, or `0.0.0.0:port` where IPv6 is
     /// disabled. Port 0 picks a random one.
-    pub fn bind(port: u16) -> io::Result<Self> {
-        match bind_dual_stack(port) {
+    /// `mark` sets SO_MARK (Linux) so policy routing can tell our packets
+    /// apart; it needs CAP_NET_ADMIN.
+    pub fn bind(port: u16, mark: Option<u32>) -> io::Result<Self> {
+        match bind_dual_stack(port, mark) {
             Ok(socket) => Ok(Self {
                 socket,
                 dual_stack: true,
             }),
             Err(e) => {
                 tracing::warn!(%e, "IPv6 unavailable, listening on IPv4 only");
-                let std = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))?;
-                std.set_nonblocking(true)?;
+                let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+                set_mark(&socket, mark)?;
+                socket.set_nonblocking(true)?;
+                socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+                let std: std::net::UdpSocket = socket.into();
                 Ok(Self {
                     socket: UdpSocket::from_std(std)?,
                     dual_stack: false,
@@ -50,13 +55,27 @@ impl Udp {
     }
 }
 
-fn bind_dual_stack(port: u16) -> io::Result<UdpSocket> {
+fn bind_dual_stack(port: u16, mark: Option<u32>) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    set_mark(&socket, mark)?;
     // Linux defaults this to off and macOS to on, so always set it.
     socket.set_only_v6(false)?;
     socket.set_nonblocking(true)?;
     socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
     UdpSocket::from_std(socket.into())
+}
+
+#[cfg(target_os = "linux")]
+fn set_mark(socket: &Socket, mark: Option<u32>) -> io::Result<()> {
+    mark.map_or(Ok(()), |m| socket.set_mark(m))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_mark(_: &Socket, mark: Option<u32>) -> io::Result<()> {
+    match mark {
+        Some(_) => Err(io::Error::other("socket marks are Linux only")),
+        None => Ok(()),
+    }
 }
 
 fn unmap(addr: SocketAddr) -> SocketAddr {
@@ -94,7 +113,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_socket_talks_to_both_families() {
-        let server = Udp::bind(0).unwrap();
+        let server = Udp::bind(0, None).unwrap();
         assert!(server.dual_stack, "test host should have IPv6 loopback");
         let port = server.local_addr().unwrap().port();
 

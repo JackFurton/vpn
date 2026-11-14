@@ -33,9 +33,19 @@ pub async fn up(
     }
 
     let port = iface.listen_port.unwrap_or(0);
-    let udp = Udp::bind(port).with_context(|| format!("binding UDP port {port}"))?;
+    let routes = crate::routes::plan(&config);
+    let mark = routes.needs_mark().then_some(crate::routes::FWMARK);
+    let udp = Udp::bind(port, mark).with_context(|| format!("binding UDP port {port}"))?;
     let tun = Tun::create(interface, &iface.addresses, iface.mtu)
         .context("creating TUN device (needs root or CAP_NET_ADMIN)")?;
+    #[cfg(target_os = "linux")]
+    crate::routes::apply(&routes, tun.name())
+        .await
+        .context("installing routes")?;
+    #[cfg(not(target_os = "linux"))]
+    if routes.needs_mark() || !routes.routes.is_empty() {
+        tracing::warn!("routes for allowed_ips are only installed automatically on Linux so far");
+    }
 
     tracing::info!(
         interface = tun.name(),
