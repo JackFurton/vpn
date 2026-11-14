@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 use vpn_proto::ip::IpHeader;
-use vpn_proto::keys::KeyPair;
-use vpnd::config::DEFAULT_MTU;
+
+use vpn_proto::keys::{KeyPair, PrivateKey};
+use vpnd::config::{Config, DEFAULT_MTU};
+use vpnd::daemon;
 use vpnd::tun::Tun;
 
 #[derive(Parser)]
@@ -18,6 +21,16 @@ struct Cli {
 enum Command {
     /// Generate a new static keypair
     Keygen,
+    /// Read a private key on stdin and print its public key
+    Pubkey,
+    /// Bring the tunnel up and run until SIGINT or SIGTERM
+    Up {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Interface name. Defaults to the OS's choice (tun0, utun3, ...).
+        #[arg(short, long)]
+        interface: Option<String>,
+    },
     /// Create a TUN device and log every packet the kernel routes into it
     #[command(hide = true)]
     TunDump {
@@ -45,6 +58,16 @@ async fn main() -> Result<()> {
             let kp = KeyPair::generate()?;
             println!("private: {}", kp.private.to_base64());
             println!("public:  {}", kp.public.to_base64());
+        }
+        Command::Pubkey => {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let private: PrivateKey = line.parse().context("parsing private key")?;
+            println!("{}", private.public_key().to_base64());
+        }
+        Command::Up { config, interface } => {
+            let config = Config::load(&config)?;
+            daemon::up(config, interface.as_deref(), daemon::shutdown_signal()).await?;
         }
         Command::TunDump {
             addresses,
