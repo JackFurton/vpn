@@ -6,6 +6,7 @@ pub mod device;
 pub mod handshake;
 pub mod ip;
 pub mod keys;
+pub mod ratelimit;
 pub mod replay;
 pub mod session;
 pub mod wire;
