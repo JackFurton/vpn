@@ -1,0 +1,24 @@
+name: Bench
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/vpn-proto/benches/**"
+      - "tests/bench.sh"
+      - ".github/workflows/bench.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq iperf3 wireguard-tools
+      - run: cargo build --release -p vpnd --locked
+      - run: sudo tests/bench.sh target/release/vpnd
+      - run: cargo bench -p vpn-proto --bench transport --locked
