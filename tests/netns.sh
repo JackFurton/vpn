@@ -113,12 +113,13 @@ echo "== ping b -> c through the server"
 ip netns exec vpn-a sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
 ip netns exec vpn-b ping -c 3 -W 2 10.8.0.3
 # The steps from docs/server-setup.md, with the same nftables file. net has no
-# route to 10.8.0.0/24, so a reply can only come back if NAT works. b needs
-# no /32 for its endpoint here: 172.31.0.0/24 is directly connected.
+# route to 10.8.0.0/24, so a reply can only come back if NAT works.
 echo "== b reaches the internet through a (exit node)"
 sed 's/^define WAN = .*/define WAN = "veth-wan"/' "$REPO/examples/nftables-exit.conf" | ip netns exec vpn-a nft -f -
-ip -n vpn-b route add 0.0.0.0/1 dev tun0
-ip -n vpn-b route add 128.0.0.0/1 dev tun0
+# b's allowed_ips is 0.0.0.0/0, so vpnd installed policy routing itself.
+ip -n vpn-b rule | grep -q 'not from all fwmark 0x7670 lookup 30320'
+ip -n vpn-b rule | grep -q 'lookup main suppress_prefixlength 0'
+ip -n vpn-b route show table 30320 | grep -q 'default dev tun0'
 ip netns exec vpn-b ping -c 3 -W 2 198.51.100.1
 ip netns exec vpn-a nft list ruleset | grep -q masquerade
 

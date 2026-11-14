@@ -78,22 +78,31 @@ prefix from your provider to the server and skip NAT entirely.
 
 ## 4. Point a client's traffic at the tunnel
 
-On the client, use `allowed_ips = ["0.0.0.0/0"]` so vpnd will send anything
-to the server. Then tell the client's kernel to use the tunnel. `vpnd up`
-doesn't touch the routing table yet beyond the tunnel subnet (#57), so for
-now:
+On the client, set `allowed_ips = ["0.0.0.0/0"]` (add `"::/0"` for IPv6
+too). On Linux, `vpnd up` then sets up routing itself, the same way wg-quick
+does:
 
-```sh
-# Keep the tunnel's own UDP packets off the tunnel. Without this they'd be
-# routed into tun0, encrypted, and routed into tun0 again.
-sudo ip route add 203.0.113.10/32 via "$(ip route show default | awk '{print $3}')"
-
-# Two halves of the address space beat the existing default route (a /1 is
-# more specific than a /0) without deleting it, so taking the tunnel down
-# restores normal routing by itself.
-sudo ip route add 0.0.0.0/1 dev tun0
-sudo ip route add 128.0.0.0/1 dev tun0
 ```
+$ ip rule
+32760:  from all lookup main suppress_prefixlength 0
+32761:  not from all fwmark 0x7670 lookup 30320
+$ ip route show table 30320
+default dev tun0
+```
+
+vpnd marks its own UDP socket with 0x7670. Unmarked traffic, which is
+everything except vpnd's packets to the server, skips the main table's
+default route (`suppress_prefixlength 0`) and lands in table 30320, which
+sends it into the tunnel. vpnd's marked packets take the normal default
+route, so the tunnel never tries to carry its own transport. This keeps
+working when the server's address changes, unlike a fixed host route.
+LAN routes in the main table still win, because only the default route is
+suppressed.
+
+On exit the kernel removes the routes along with the TUN device. The two
+rules stay behind, because vpnd no longer has the privilege to delete them,
+but with table 30320 empty they just fall through. The next `vpnd up`
+removes them.
 
 `curl https://ifconfig.me` from the client should now print the server's IP.
 
@@ -101,11 +110,13 @@ sudo ip route add 128.0.0.0/1 dev tun0
 
 A client at 10.8.0.2 opens a connection to 93.184.215.14:
 
-1. The client's kernel looks up 93.184.215.14, matches `0.0.0.0/1 dev tun0`,
+1. The client's kernel looks up 93.184.215.14. The packet isn't marked, so it
+   gets table 30320's `default dev tun0`,
    and hands the packet to vpnd through the TUN device.
 2. vpnd's routing table (`allowed_ips`) maps it to the server, so vpnd
    encrypts it and sends a UDP datagram from the client's real address to the
-   server's port 51820. The outer packet takes the `/32` route, not the tunnel.
+   server's port 51820. The outer packet carries vpnd's mark, so it takes the
+   normal default route instead of the tunnel.
 3. The server's vpnd authenticates and decrypts it, checks that the inner
    source 10.8.0.2 routes back to the peer that sent it, and writes the inner
    packet to `tun0`.

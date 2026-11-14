@@ -180,8 +180,8 @@ mod tests {
     #[tokio::test]
     async fn forwards_both_directions_over_real_udp() {
         let (ka, kb) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
-        let udp_a = Udp::bind(0).unwrap();
-        let udp_b = Udp::bind(0).unwrap();
+        let udp_a = Udp::bind(0, None).unwrap();
+        let udp_b = Udp::bind(0, None).unwrap();
         let b_port = udp_b.local_addr().unwrap().port();
 
         let mut a = Device::new(ka.private, 1420);
