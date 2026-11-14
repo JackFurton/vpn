@@ -46,6 +46,10 @@ fn to_array(bytes: &[u8]) -> Result<[u8; KEY_LEN], KeyError> {
 macro_rules! key_impls {
     ($t:ident) => {
         impl $t {
+            pub const fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+                Self(bytes)
+            }
+
             pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
                 &self.0
             }

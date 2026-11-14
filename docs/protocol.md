@@ -6,7 +6,9 @@ design follows WireGuard closely (https://www.wireguard.com/papers/wireguard.pdf
 and the differences are listed at the end. It is not wire compatible with
 WireGuard.
 
-All integers are little-endian. All sizes are in bytes.
+All integers are little-endian, except the TAI64N timestamp in the handshake.
+That one is big-endian by definition, so two timestamps compare correctly as
+raw bytes. All sizes are in bytes.
 
 ## Goals and non-goals
 
