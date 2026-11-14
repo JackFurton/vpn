@@ -1,0 +1,84 @@
+name: Release
+
+# A v* tag builds, attests and publishes. PRs that touch this file run the
+# builds as a dry run, without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl: fully static, so one Linux binary runs on any distro
+          # instead of only ones with this runner's glibc or newer.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "$want" = "$have" ] || { echo "tag $GITHUB_REF_NAME, but Cargo.toml says $have"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p vpnd --target ${{ matrix.target }}
+      - name: Smoke test
+        run: |
+          bin=target/${{ matrix.target }}/release/vpnd
+          "$bin" --version
+          "$bin" keygen > /dev/null
+          if [ "$RUNNER_OS" = Linux ]; then
+            file "$bin" | grep -Eq 'statically linked|static-pie linked' || { file "$bin"; echo "not static"; exit 1; }
+          fi
+      - name: Package
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          [[ "$GITHUB_REF" == refs/tags/* ]] || version=dev
+          name="vpnd-$version-${{ matrix.target }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/vpnd" LICENSE README.md "$name/"
+          cp -r examples packaging "$name/"
+          mkdir -p "$name/docs" && cp docs/server-setup.md "$name/docs/"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: vpnd-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum vpnd-*.tar.gz | tee SHA256SUMS
+      # Signed SLSA provenance: proves each tarball came from this workflow
+      # at this commit. Check with: gh attestation verify FILE -R JackFurton/vpn
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/vpnd-*.tar.gz
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
