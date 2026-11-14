@@ -234,19 +234,55 @@ the outer IP and UDP headers add more on top:
 The default tunnel MTU is 1420, which fits either outer IP version. Padding
 never takes a packet past the tunnel MTU.
 
-## Session limits (implemented in #11)
+## Session lifecycle
 
 These constants come from WireGuard:
 
-| Constant | Value | Meaning |
-|---|---|---|
-| `REKEY_AFTER_MESSAGES` | 2^60 | start a new handshake |
-| `REJECT_AFTER_MESSAGES` | 2^64 - 2^13 - 1 | stop using the key |
-| `REKEY_AFTER_TIME` | 120 s | start a new handshake |
-| `REJECT_AFTER_TIME` | 180 s | stop using the key |
-| `REKEY_ATTEMPT_TIME` | 90 s | give up retrying a handshake |
-| `REKEY_TIMEOUT` | 5 s | retry an unanswered initiation |
-| `KEEPALIVE_TIMEOUT` | 10 s | send a keepalive if we received but didn't send |
+| Constant | Value |
+|---|---|
+| `REKEY_AFTER_MESSAGES` | 2^60 |
+| `REJECT_AFTER_MESSAGES` | 2^64 - 2^13 - 1 |
+| `REKEY_AFTER_TIME` | 120 s |
+| `REJECT_AFTER_TIME` | 180 s |
+| `REKEY_ATTEMPT_TIME` | 90 s |
+| `REKEY_TIMEOUT` | 5 s |
+| `KEEPALIVE_TIMEOUT` | 10 s |
+
+Each peer keeps up to three sessions:
+
+- **current**: the one we send on.
+- **previous**: the session current replaced. It's receive-only, so packets the
+  peer sent before it switched still decrypt.
+- **next**: a session we accepted as responder. It becomes current when the
+  first data packet arrives on it.
+
+The rules:
+
+1. **Rekey by age.** When the side that started the current session sends a
+   packet and the session is at least `REKEY_AFTER_TIME` old, it sends that
+   packet and then starts a new handshake. Only the initiator does this, so
+   the two sides don't both start handshakes at the same moment.
+2. **Rekey by count.** Either side starts a new handshake after sending
+   `REKEY_AFTER_MESSAGES` on one session.
+3. **Rekey on receive.** If the initiator receives data on a session at least
+   `REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT` (165 s) old, it
+   rekeys. That way, traffic flowing only from the responder still gets a new
+   session before the old one expires.
+4. **Expiry.** Never send or accept on a session older than
+   `REJECT_AFTER_TIME`. Packets for an expired session get queued and a
+   handshake starts.
+5. **Retry.** Resend an unanswered initiation every `REKEY_TIMEOUT`. After
+   `REKEY_ATTEMPT_TIME`, give up and drop the queued packets.
+6. **Passive keepalive.** After receiving data, if we've sent nothing within
+   `KEEPALIVE_TIMEOUT`, send a keepalive. This tells the peer we're still here.
+7. **Dead peer.** After sending data, if we've heard nothing within
+   `KEEPALIVE_TIMEOUT + REKEY_TIMEOUT` (15 s), start a new handshake. A live
+   peer's passive keepalive always arrives before this fires. So when it does
+   fire, the peer has most likely restarted and forgotten the session.
+8. **Persistent keepalive** (optional, per peer). Send a keepalive whenever
+   nothing has been sent for the configured interval, and bring the session
+   up at startup without waiting for traffic. This holds NAT mappings open,
+   so the far side can reach a peer that's behind NAT.
 
 ## Differences from WireGuard
 

@@ -172,12 +172,14 @@ mod tests {
             public_key: kb.public,
             endpoint: Some(udp_b.local_addr().unwrap()),
             allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
         });
         let mut b = Device::new(kb.private, 1420);
         b.add_peer(PeerConfig {
             public_key: ka.public,
             endpoint: None,
             allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
+            persistent_keepalive: None,
         });
 
         let mut a = spawn(a, udp_a);

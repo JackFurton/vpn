@@ -1,6 +1,8 @@
 //! The whole tunnel as a sans-IO state machine: feed it packets from the TUN
 //! device, datagrams from the UDP socket, and the time; it fills an `Outbox`
 //! with what to send where. The event loop in vpnd only moves bytes.
+//!
+//! Session lifetimes and timers follow WireGuard (whitepaper section 6).
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
@@ -15,15 +17,39 @@ use crate::ip::IpHeader;
 use crate::keys::{PrivateKey, PublicKey};
 use crate::session::{Session, TransportError};
 use crate::wire::{
-    Data, HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, HandshakeInit, HandshakeResponse, Message,
+    DATA_MIN_LEN, Data, HANDSHAKE_INIT_LEN, HANDSHAKE_RESPONSE_LEN, HandshakeInit,
+    HandshakeResponse, Message, TAG_LEN,
 };
 
+/// Start a new handshake once a session has carried this many messages.
+pub const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
+/// The side that started a session starts a new one after this long.
+pub const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
+/// Never send or accept on a session older than this.
+pub const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 /// Resend an unanswered initiation after this long.
 pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stop retrying a handshake (and drop queued packets) after this long.
 pub const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
+/// Reply with a keepalive if we received data and sent nothing for this long.
+pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Packets held per peer while a handshake is in flight.
 pub const MAX_QUEUED: usize = 128;
+
+/// If we sent data and heard nothing back for this long, the peer probably
+/// lost our session (a restart, say), so start a new one. Longer than
+/// KEEPALIVE_TIMEOUT so a live peer's passive keepalive always gets here first.
+const DEAD_PEER_TIMEOUT: Duration = Duration::from_secs(15);
+/// The initiator rekeys this early on receive, so a session that only carries
+/// traffic towards us is replaced before the responder hits REJECT_AFTER_TIME.
+const REKEY_ON_RECEIVE_AGE: Duration = Duration::from_secs(165);
+
+const _: () =
+    assert!(DEAD_PEER_TIMEOUT.as_secs() == KEEPALIVE_TIMEOUT.as_secs() + REKEY_TIMEOUT.as_secs());
+const _: () = assert!(
+    REKEY_ON_RECEIVE_AGE.as_secs()
+        == REJECT_AFTER_TIME.as_secs() - KEEPALIVE_TIMEOUT.as_secs() - REKEY_TIMEOUT.as_secs()
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dest {
@@ -91,6 +117,8 @@ pub struct PeerConfig {
     pub public_key: PublicKey,
     pub endpoint: Option<SocketAddr>,
     pub allowed_ips: Vec<IpNet>,
+    /// Send a keepalive this often when idle, to hold NAT mappings open.
+    pub persistent_keepalive: Option<Duration>,
 }
 
 struct Attempt {
@@ -100,18 +128,95 @@ struct Attempt {
     last_sent: Instant,
 }
 
+/// A session plus the timing the device needs to retire it.
+struct Slot {
+    session: Session,
+    born: Instant,
+    we_initiated: bool,
+}
+
+impl Slot {
+    fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.born)
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.age(now) >= REJECT_AFTER_TIME
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Which {
+    Current,
+    Previous,
+    Next,
+}
+
 struct Peer {
     public_key: PublicKey,
     endpoint: Option<SocketAddr>,
     allowed_ips: Vec<IpNet>,
+    persistent_keepalive: Option<Duration>,
     /// Confirmed session we send on.
-    current: Option<Session>,
+    current: Option<Slot>,
+    /// The session `current` replaced. Receive-only, so packets the peer sent
+    /// before it switched still decrypt.
+    previous: Option<Slot>,
     /// Session we accepted as responder, waiting for the initiator's first
     /// packet before we may send on it.
-    next: Option<Session>,
+    next: Option<Slot>,
     attempt: Option<Attempt>,
     last_init: Option<Tai64N>,
     queue: VecDeque<Vec<u8>>,
+    /// When we last sent a transport packet, data or keepalive.
+    last_sent: Option<Instant>,
+    /// First data we sent since we last heard anything from the peer.
+    awaiting_reply: Option<Instant>,
+    /// First data we received since we last sent anything.
+    owe_keepalive: Option<Instant>,
+}
+
+impl Peer {
+    fn slot(&mut self, which: Which) -> &mut Option<Slot> {
+        match which {
+            Which::Current => &mut self.current,
+            Which::Previous => &mut self.previous,
+            Which::Next => &mut self.next,
+        }
+    }
+
+    fn find(&self, index: u32) -> Option<Which> {
+        [
+            (Which::Current, &self.current),
+            (Which::Previous, &self.previous),
+            (Which::Next, &self.next),
+        ]
+        .into_iter()
+        .find_map(|(w, s)| {
+            s.as_ref()
+                .is_some_and(|s| s.session.local_index == index)
+                .then_some(w)
+        })
+    }
+
+    fn mark_sent(&mut self, now: Instant, data: bool) {
+        self.last_sent = Some(now);
+        self.owe_keepalive = None;
+        if data && self.awaiting_reply.is_none() {
+            self.awaiting_reply = Some(now);
+        }
+    }
+
+    fn mark_received(&mut self, now: Instant, data: bool) {
+        self.awaiting_reply = None;
+        if data && self.owe_keepalive.is_none() {
+            self.owe_keepalive = Some(now);
+        }
+    }
+
+    fn promote(&mut self, slot: Slot) {
+        self.previous = self.current.replace(slot);
+    }
 }
 
 pub struct Device {
@@ -134,11 +239,16 @@ impl Device {
             public_key: c.public_key,
             endpoint: c.endpoint,
             allowed_ips: c.allowed_ips,
+            persistent_keepalive: c.persistent_keepalive,
             current: None,
+            previous: None,
             next: None,
             attempt: None,
             last_init: None,
             queue: VecDeque::new(),
+            last_sent: None,
+            awaiting_reply: None,
+            owe_keepalive: None,
         });
     }
 
@@ -166,24 +276,66 @@ impl Device {
         out: &mut Outbox,
     ) {
         match Message::parse(datagram) {
-            Ok(Message::HandshakeInit(m)) => self.on_init(&m, from, out),
+            Ok(Message::HandshakeInit(m)) => self.on_init(&m, from, now, out),
             Ok(Message::HandshakeResponse(m)) => self.on_response(&m, from, now, out),
             Ok(Message::Data(d)) => self.on_data(&d, now, out),
             Err(e) => trace!(%from, %e, "dropping datagram"),
         }
     }
 
-    /// Call periodically, a few times a second, to drive retries.
+    /// Drives every timer. Call a few times a second.
     pub fn tick(&mut self, now: Instant, out: &mut Outbox) {
         for i in 0..self.peers.len() {
             let peer = &mut self.peers[i];
-            let Some(a) = &peer.attempt else { continue };
-            if now.saturating_duration_since(a.first_sent) >= REKEY_ATTEMPT_TIME {
-                debug!(peer = ?peer.public_key, dropped = peer.queue.len(), "handshake timed out");
-                peer.attempt = None;
-                peer.queue.clear();
-            } else if now.saturating_duration_since(a.last_sent) >= REKEY_TIMEOUT {
+            for which in [Which::Current, Which::Previous, Which::Next] {
+                let slot = peer.slot(which);
+                if slot.as_ref().is_some_and(|s| s.expired(now)) {
+                    *slot = None;
+                }
+            }
+
+            if let Some(a) = &peer.attempt {
+                if now.saturating_duration_since(a.first_sent) >= REKEY_ATTEMPT_TIME {
+                    debug!(peer = ?peer.public_key, dropped = peer.queue.len(), "handshake timed out");
+                    peer.attempt = None;
+                    peer.queue.clear();
+                } else if now.saturating_duration_since(a.last_sent) >= REKEY_TIMEOUT {
+                    self.initiate(i, now, out);
+                }
+                continue;
+            }
+
+            if peer
+                .awaiting_reply
+                .is_some_and(|t| now.saturating_duration_since(t) >= DEAD_PEER_TIMEOUT)
+            {
+                debug!(peer = ?peer.public_key, "no reply to our data, starting a new handshake");
+                peer.awaiting_reply = None;
                 self.initiate(i, now, out);
+                continue;
+            }
+
+            if peer
+                .owe_keepalive
+                .is_some_and(|t| now.saturating_duration_since(t) >= KEEPALIVE_TIMEOUT)
+            {
+                self.send_keepalive(i, now, out);
+            }
+
+            let peer = &self.peers[i];
+            if let Some(interval) = peer.persistent_keepalive {
+                if peer.current.is_some() {
+                    if peer
+                        .last_sent
+                        .is_none_or(|t| now.saturating_duration_since(t) >= interval)
+                    {
+                        self.send_keepalive(i, now, out);
+                    }
+                } else if peer.endpoint.is_some() {
+                    // Bring the session up without waiting for traffic, so
+                    // a peer behind NAT is reachable from the other side.
+                    self.initiate(i, now, out);
+                }
             }
         }
     }
@@ -205,11 +357,20 @@ impl Device {
     fn send_or_queue(&mut self, i: usize, packet: &[u8], now: Instant, out: &mut Outbox) {
         let mtu = self.mtu;
         let peer = &mut self.peers[i];
-        if let (Some(s), Some(ep)) = (peer.current.as_mut(), peer.endpoint) {
+        let usable = peer.current.as_mut().filter(|s| !s.expired(now));
+        if let (Some(slot), Some(ep)) = (usable, peer.endpoint) {
             let max = Session::encrypted_len(packet.len(), mtu);
-            match out.push(Dest::Udp(ep), max, |b| s.encrypt(packet, mtu, b)) {
-                Ok(_) => return,
-                Err(TransportError::CounterExhausted) => peer.current = None,
+            match out.push(Dest::Udp(ep), max, |b| slot.session.encrypt(packet, mtu, b)) {
+                Ok(_) => {
+                    let rekey = (slot.we_initiated && slot.age(now) >= REKEY_AFTER_TIME)
+                        || slot.session.send_counter >= REKEY_AFTER_MESSAGES;
+                    peer.mark_sent(now, true);
+                    if rekey && peer.attempt.is_none() {
+                        self.initiate(i, now, out);
+                    }
+                    return;
+                }
+                Err(TransportError::CounterExhausted) => {}
                 Err(e) => {
                     debug!(%e, "dropping outbound packet");
                     return;
@@ -223,6 +384,21 @@ impl Device {
         }
         if peer.attempt.is_none() {
             self.initiate(i, now, out);
+        }
+    }
+
+    fn send_keepalive(&mut self, i: usize, now: Instant, out: &mut Outbox) {
+        let peer = &mut self.peers[i];
+        // With no usable session there's nothing to keep alive; settle the
+        // debt either way so the timer doesn't fire every tick.
+        peer.owe_keepalive = None;
+        let usable = peer.current.as_mut().filter(|s| !s.expired(now));
+        if let (Some(slot), Some(ep)) = (usable, peer.endpoint)
+            && out
+                .push(Dest::Udp(ep), DATA_MIN_LEN, |b| slot.session.keepalive(b))
+                .is_ok()
+        {
+            peer.mark_sent(now, false);
         }
     }
 
@@ -264,10 +440,7 @@ impl Device {
         loop {
             let candidate = getrandom::u32().expect("OS random source failed");
             let in_use = self.peers.iter().any(|p| {
-                [&p.current, &p.next]
-                    .into_iter()
-                    .flatten()
-                    .any(|s| s.local_index == candidate)
+                p.find(candidate).is_some()
                     || p.attempt
                         .as_ref()
                         .and_then(|a| a.initiator.as_ref())
@@ -279,7 +452,7 @@ impl Device {
         }
     }
 
-    fn on_init(&mut self, m: &HandshakeInit, from: SocketAddr, out: &mut Outbox) {
+    fn on_init(&mut self, m: &HandshakeInit, from: SocketAddr, now: Instant, out: &mut Outbox) {
         let received = match read_init(&self.private, m) {
             Ok(r) => r,
             Err(e) => {
@@ -304,7 +477,12 @@ impl Device {
                 // The initiation proved the sender holds the peer's key and
                 // the timestamp proved it's fresh, so this is where it lives now.
                 peer.endpoint = Some(from);
-                peer.next = Some(session);
+                peer.next = Some(Slot {
+                    session,
+                    born: now,
+                    we_initiated: false,
+                });
+                peer.mark_received(now, false);
             }
             Err(e) => debug!(%from, %e, "rejecting initiation"),
         }
@@ -332,8 +510,13 @@ impl Device {
         match initiator.finish(m) {
             Ok(session) => {
                 peer.attempt = None;
-                peer.current = Some(session);
+                peer.promote(Slot {
+                    session,
+                    born: now,
+                    we_initiated: true,
+                });
                 peer.endpoint = Some(from);
+                peer.mark_received(now, false);
                 self.flush(i, true, now, out);
             }
             // The index is visible on the wire, so anyone can send a bogus
@@ -343,55 +526,52 @@ impl Device {
     }
 
     fn on_data(&mut self, d: &Data, now: Instant, out: &mut Outbox) {
-        let found = self.peers.iter().enumerate().find_map(|(i, p)| {
-            if p.current
-                .as_ref()
-                .is_some_and(|s| s.local_index == d.receiver_index)
-            {
-                Some((i, false))
-            } else if p
-                .next
-                .as_ref()
-                .is_some_and(|s| s.local_index == d.receiver_index)
-            {
-                Some((i, true))
-            } else {
-                None
-            }
-        });
-        let Some((i, is_next)) = found else {
+        let Some((i, which)) = self
+            .peers
+            .iter()
+            .enumerate()
+            .find_map(|(i, p)| p.find(d.receiver_index).map(|w| (i, w)))
+        else {
             trace!(index = d.receiver_index, "data for unknown session");
             return;
         };
         let peer = &mut self.peers[i];
-        let session = if is_next {
-            &mut peer.next
-        } else {
-            &mut peer.current
-        };
-        let session = session.as_mut().expect("found above");
+        let slot = peer.slot(which).as_mut().expect("found above");
+        if slot.expired(now) {
+            trace!("data for expired session");
+            return;
+        }
+        let rekey_on_receive = matches!(which, Which::Current)
+            && slot.we_initiated
+            && slot.age(now) >= REKEY_ON_RECEIVE_AGE;
 
-        let max = d.ciphertext.len().saturating_sub(crate::wire::TAG_LEN);
-        let packet = match out.push(Dest::Tun, max, |b| session.decrypt(d, b).map(<[u8]>::len)) {
+        let max = d.ciphertext.len().saturating_sub(TAG_LEN);
+        let packet = match out.push(Dest::Tun, max, |b| {
+            slot.session.decrypt(d, b).map(<[u8]>::len)
+        }) {
             Ok(p) => p,
             Err(e) => {
                 trace!(%e, "dropping data");
                 return;
             }
         };
-        let allowed = match IpHeader::parse(packet) {
-            None => false,
-            Some(h) => peer.allowed_ips.iter().any(|n| n.contains(&h.src)),
-        };
-        if packet.is_empty() || !allowed {
-            if !packet.is_empty() {
+        let is_data = !packet.is_empty();
+        let allowed = IpHeader::parse(packet)
+            .is_some_and(|h| peer.allowed_ips.iter().any(|n| n.contains(&h.src)));
+        if !is_data || !allowed {
+            if is_data {
                 debug!(peer = ?peer.public_key, "dropping packet from a source outside allowed_ips");
             }
             out.pop();
         }
-        if is_next {
-            peer.current = peer.next.take();
+        peer.mark_received(now, is_data);
+
+        if matches!(which, Which::Next) {
+            let slot = peer.next.take().expect("found above");
+            peer.promote(slot);
             self.flush(i, false, now, out);
+        } else if rekey_on_receive && peer.attempt.is_none() {
+            self.initiate(i, now, out);
         }
     }
 
@@ -405,10 +585,7 @@ impl Device {
             self.send_or_queue(i, &packet, now, out);
         }
         if initiator && !had_queued {
-            let peer = &mut self.peers[i];
-            if let (Some(s), Some(ep)) = (peer.current.as_mut(), peer.endpoint) {
-                let _ = out.push(Dest::Udp(ep), crate::wire::DATA_MIN_LEN, |b| s.keepalive(b));
-            }
+            self.send_keepalive(i, now, out);
         }
     }
 }
@@ -464,30 +641,51 @@ mod tests {
         /// Datagrams the network should drop, by message type byte.
         drop_types: Vec<u8>,
         sent: Vec<u8>,
+        b_private: PrivateKey,
+        a_public: PublicKey,
     }
 
     impl Net {
         fn new() -> Self {
+            Self::with_keepalive(None)
+        }
+
+        fn with_keepalive(persistent_keepalive: Option<Duration>) -> Self {
             let (ka, kb) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+            let (b_private, a_public) = (kb.private.clone(), ka.public.clone());
             let mut a = Device::new(ka.private, 1420);
             a.add_peer(PeerConfig {
                 public_key: kb.public,
                 endpoint: Some(B),
                 allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
+                persistent_keepalive,
             });
-            let mut b = Device::new(kb.private, 1420);
-            b.add_peer(PeerConfig {
-                public_key: ka.public,
-                endpoint: None,
-                allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
-            });
+            let b = Self::fresh_b(kb.private.clone(), ka.public.clone());
             Self {
                 a,
                 b,
                 now: Instant::now(),
                 drop_types: vec![],
                 sent: vec![],
+                b_private,
+                a_public,
             }
+        }
+
+        fn fresh_b(private: PrivateKey, a_public: PublicKey) -> Device {
+            let mut b = Device::new(private, 1420);
+            b.add_peer(PeerConfig {
+                public_key: a_public,
+                endpoint: None,
+                allowed_ips: vec!["10.0.0.1/32".parse().unwrap()],
+                persistent_keepalive: None,
+            });
+            b
+        }
+
+        /// B loses all state, as if the process restarted.
+        fn restart_b(&mut self) {
+            self.b = Self::fresh_b(self.b_private.clone(), self.a_public.clone());
         }
 
         /// Delivers everything in `out` (emitted by the device at `from`)
@@ -534,6 +732,22 @@ mod tests {
             let mut out = Outbox::new();
             self.a.tick(self.now, &mut out);
             self.pump(A, out)
+        }
+
+        fn tick_b(&mut self, after: Duration) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+            self.now += after;
+            let mut out = Outbox::new();
+            self.b.tick(self.now, &mut out);
+            self.pump(B, out)
+        }
+
+        fn a_index(&self) -> u32 {
+            self.a.peers[0]
+                .current
+                .as_ref()
+                .unwrap()
+                .session
+                .local_index
         }
     }
 
@@ -650,6 +864,7 @@ mod tests {
             public_key: b_public,
             endpoint: Some(B),
             allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
         });
         let mut out = Outbox::new();
         c.handle_tun(&to_b(1), net.now, &mut out);
@@ -663,5 +878,160 @@ mod tests {
         net.send_b(&to_a(1));
         assert!(net.sent.is_empty());
         assert!(net.b.peers[0].queue.is_empty());
+    }
+
+    #[test]
+    fn initiator_rekeys_after_rekey_after_time() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        let old = net.a_index();
+        net.now += REKEY_AFTER_TIME;
+
+        // B is the responder for this session, so its traffic doesn't rekey.
+        let (at_a, _) = net.send_b(&to_a(2));
+        assert_eq!(at_a, vec![to_a(2)]);
+        assert_eq!(net.sent, [1, 2, 4, 4]);
+
+        // A's next send goes out on the old session, then starts a new one.
+        let (_, at_b) = net.send_a(&to_b(3));
+        assert_eq!(at_b, vec![to_b(3)]);
+        assert_eq!(net.sent, [1, 2, 4, 4, 4, 1, 2, 4]);
+        assert_ne!(net.a_index(), old);
+        assert_eq!(
+            net.a.peers[0]
+                .previous
+                .as_ref()
+                .unwrap()
+                .session
+                .local_index,
+            old
+        );
+        assert!(
+            net.b.peers[0].next.is_none(),
+            "keepalive promoted B's new session"
+        );
+    }
+
+    #[test]
+    fn rekeys_after_rekey_after_messages() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        net.a.peers[0]
+            .current
+            .as_mut()
+            .unwrap()
+            .session
+            .send_counter = REKEY_AFTER_MESSAGES;
+        net.send_a(&to_b(2));
+        assert_eq!(net.sent, [1, 2, 4, 4, 1, 2, 4]);
+    }
+
+    #[test]
+    fn previous_session_still_decrypts_in_flight_packets() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        net.send_b(&to_a(2));
+
+        let mut in_flight = Outbox::new();
+        net.b.handle_tun(&to_a(9), net.now, &mut in_flight);
+
+        net.now += REKEY_AFTER_TIME;
+        net.send_a(&to_b(3));
+        assert!(net.a.peers[0].previous.is_some());
+
+        let (at_a, _) = net.pump(B, in_flight);
+        assert_eq!(at_a, vec![to_a(9)]);
+    }
+
+    #[test]
+    fn idle_sessions_expire_on_tick() {
+        let mut net = Net::new();
+        let mut out = Outbox::new();
+        net.a.initiate(0, net.now, &mut out);
+        net.pump(A, out);
+        assert!(net.b.peers[0].current.is_some());
+
+        net.tick_a(REJECT_AFTER_TIME);
+        net.tick_b(Duration::ZERO);
+        assert!(net.a.peers[0].current.is_none());
+        assert!(net.b.peers[0].current.is_none());
+    }
+
+    #[test]
+    fn expired_session_is_refused_before_any_tick() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        net.send_b(&to_a(2));
+        let old = net.a_index();
+        let mut held = Outbox::new();
+        net.a.handle_tun(&to_b(3), net.now, &mut held);
+
+        net.now += REJECT_AFTER_TIME;
+        let (_, at_b) = net.pump(A, held);
+        assert!(at_b.is_empty(), "B refuses a packet on an expired session");
+
+        let (_, at_b) = net.send_a(&to_b(4));
+        assert_eq!(at_b, vec![to_b(4)]);
+        assert_ne!(net.a_index(), old);
+    }
+
+    #[test]
+    fn passive_keepalive_after_receiving_data() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        net.send_b(&to_a(2));
+        let before = net.sent.len();
+
+        net.tick_a(KEEPALIVE_TIMEOUT - Duration::from_millis(1));
+        assert_eq!(net.sent.len(), before);
+        net.tick_a(Duration::from_millis(1));
+        assert_eq!(net.sent[before..], [4]);
+        // Paid once; no further keepalives without new data.
+        net.tick_a(KEEPALIVE_TIMEOUT);
+        assert_eq!(net.sent.len(), before + 1);
+    }
+
+    #[test]
+    fn replying_with_data_cancels_keepalive() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        net.send_b(&to_a(2));
+        net.send_a(&to_b(3));
+        let before = net.sent.len();
+        net.tick_a(KEEPALIVE_TIMEOUT);
+        assert_eq!(net.sent.len(), before);
+    }
+
+    #[test]
+    fn recovers_when_peer_restarts() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        net.send_b(&to_a(2));
+
+        net.restart_b();
+        let (_, at_b) = net.send_a(&to_b(3));
+        assert!(at_b.is_empty(), "restarted B doesn't know the old session");
+
+        let before = net.sent.len();
+        net.tick_a(DEAD_PEER_TIMEOUT - Duration::from_millis(1));
+        assert_eq!(net.sent.len(), before);
+        net.tick_a(Duration::from_millis(1));
+        assert_eq!(net.sent[before..], [1, 2, 4]);
+
+        let (_, at_b) = net.send_a(&to_b(4));
+        assert_eq!(at_b, vec![to_b(4)]);
+    }
+
+    #[test]
+    fn persistent_keepalive_brings_session_up_and_holds_it() {
+        let mut net = Net::with_keepalive(Some(Duration::from_secs(25)));
+        net.tick_a(Duration::ZERO);
+        assert_eq!(net.sent, [1, 2, 4], "handshake without any traffic");
+        assert!(net.b.peers[0].current.is_some());
+
+        net.tick_a(Duration::from_secs(24));
+        assert_eq!(net.sent.len(), 3);
+        net.tick_a(Duration::from_secs(1));
+        assert_eq!(net.sent, [1, 2, 4, 4]);
     }
 }
