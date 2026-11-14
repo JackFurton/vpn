@@ -14,6 +14,7 @@ use crate::udp::Udp;
 pub async fn up(
     config: Config,
     interface: Option<&str>,
+    user: Option<&str>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let iface = &config.interface;
@@ -58,6 +59,9 @@ pub async fn up(
         }
         None => None,
     };
+    // Everything privileged is open; nothing after this needs privilege.
+    // Tearing the interface down on exit only needs the fd closed.
+    crate::privdrop::drop_privileges(user)?;
     event_loop::run(device, &tun, &udp, mtu, metrics, shutdown).await?;
     // Dropping the TUN fd removes the interface and its routes.
     tracing::info!(interface = tun.name(), "tunnel down");
