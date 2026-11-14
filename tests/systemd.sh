@@ -19,7 +19,7 @@ cleanup() {
   fi
   systemctl stop "$UNIT" 2>/dev/null || true
   [ -n "${ECHO_PID:-}" ] && kill "$ECHO_PID" 2>/dev/null || true
-  rm -f /etc/systemd/system/vpnd@.service /etc/vpnd/vpntest.toml
+  rm -f /etc/systemd/system/vpnd@.service /etc/vpnd/vpntest.toml /etc/sysusers.d/vpnd.conf
   systemctl daemon-reload
   exit $status
 }
@@ -48,6 +48,8 @@ endpoint = "127.0.0.1:51898"
 allowed_ips = ["10.99.0.0/24"]
 CONF
 chmod 600 /etc/vpnd/vpntest.toml
+install -m 644 "$REPO/packaging/sysusers.d/vpnd.conf" /etc/sysusers.d/
+systemd-sysusers
 install -m 644 "$REPO/packaging/systemd/vpnd@.service" /etc/systemd/system/
 systemctl daemon-reload
 
@@ -69,7 +71,7 @@ echo "== running unprivileged"
 pid=$(systemctl show -p MainPID --value "$UNIT")
 grep -E '^(Uid|CapEff|CapPrm|CapAmb|NoNewPrivs)' "/proc/$pid/status"
 uid=$(awk '/^Uid:/ { print $2 }' "/proc/$pid/status")
-[ "$uid" != 0 ] || { echo "running as root"; exit 1; }
+[ "$uid" = "$(id -u vpnd)" ] || { echo "running as uid $uid, not vpnd"; exit 1; }
 grep -q '^CapEff:[[:space:]]*0000000000000000$' "/proc/$pid/status"
 grep -q '^CapPrm:[[:space:]]*0000000000000000$' "/proc/$pid/status"
 

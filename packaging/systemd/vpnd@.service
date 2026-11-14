@@ -11,16 +11,16 @@ Type=exec
 # systemd reads the root-only config and hands the service a private copy,
 # so the service user never needs access to /etc/vpnd.
 LoadCredential=config:/etc/vpnd/%i.toml
-ExecStart=/usr/local/bin/vpnd up -c ${CREDENTIALS_DIRECTORY}/config -i %i
+ExecStart=/usr/local/bin/vpnd up -c ${CREDENTIALS_DIRECTORY}/config -i %i --user vpnd
 Restart=on-failure
 RestartSec=2s
 
-# A throwaway uid that exists only while the service runs, holding only the
-# capability needed to create the TUN device. vpnd drops even that once the
-# tunnel is up.
-DynamicUser=yes
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
+# Starts as root, because systemd-resolved only takes DNS settings from uid
+# 0 (CAP_NET_ADMIN isn't enough), but with every capability gone except the
+# three setup needs: create the TUN device, then switch users. Once the
+# tunnel is up vpnd becomes the vpnd user (packaging/sysusers.d) and drops
+# even those.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID
 NoNewPrivileges=yes
 
 DevicePolicy=closed

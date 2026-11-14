@@ -5,6 +5,9 @@
 private_key = "<PRIVATE_KEY>"
 # No listen_port: a random one is fine since the server never dials us.
 addresses = ["10.8.0.2/24"]
+# Resolve names through the server while the tunnel is up. Uses
+# systemd-resolved on Linux; vpnd refuses to start if it can't apply this.
+# dns = ["10.8.0.1"]
 
 [[peer]]
 public_key = "<PEER_PUBLIC_KEY>"

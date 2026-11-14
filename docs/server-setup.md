@@ -24,16 +24,18 @@ or security group in front of the server.
 
 ```sh
 sudo mv server.toml /etc/vpnd/vpn0.toml   # root:root, mode 600
+sudo install -m 644 packaging/sysusers.d/vpnd.conf /etc/sysusers.d/
+sudo systemd-sysusers
 sudo install -m 644 packaging/systemd/vpnd@.service /etc/systemd/system/
 sudo systemctl enable --now vpnd@vpn0
 journalctl -u vpnd@vpn0 -f
 ```
 
 The instance name is both the config file's name and the interface name.
-The unit runs vpnd as a throwaway user that has only `CAP_NET_ADMIN`.
-systemd hands it a private copy of the config through `LoadCredential`, so
-the file can stay readable only by root. vpnd gives up the capability once
-the tunnel is up.
+vpnd starts as root with only the capabilities setup needs. systemd hands
+it a private copy of the config through `LoadCredential`, so the file can
+stay readable only by root. Once the tunnel, routes and DNS are in place,
+vpnd switches to the `vpnd` user and drops every capability.
 
 Or with Docker:
 
