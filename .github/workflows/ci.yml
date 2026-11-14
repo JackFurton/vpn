@@ -67,3 +67,10 @@ jobs:
       - run: cargo build -p vpnd --locked
       - run: command -v nft || (sudo apt-get update -qq && sudo apt-get install -y -qq nftables)
       - run: sudo tests/netns.sh target/debug/vpnd
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t vpnd:ci .

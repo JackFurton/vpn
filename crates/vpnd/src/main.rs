@@ -40,6 +40,10 @@ enum Command {
         /// Interface name. Defaults to the OS's choice (tun0, utun3, ...).
         #[arg(short, long)]
         interface: Option<String>,
+        /// Switch to this user (name or uid) once the tunnel is up. Needs
+        /// vpnd started as root. Linux only.
+        #[arg(short, long)]
+        user: Option<String>,
     },
     /// Create a TUN device and log every packet the kernel routes into it
     #[command(hide = true)]
@@ -79,9 +83,19 @@ async fn main() -> Result<()> {
             let private: PrivateKey = line.parse().context("parsing private key")?;
             println!("{}", private.public_key().to_base64());
         }
-        Command::Up { config, interface } => {
+        Command::Up {
+            config,
+            interface,
+            user,
+        } => {
             let config = Config::load(&config)?;
-            daemon::up(config, interface.as_deref(), daemon::shutdown_signal()).await?;
+            daemon::up(
+                config,
+                interface.as_deref(),
+                user.as_deref(),
+                daemon::shutdown_signal(),
+            )
+            .await?;
         }
         Command::TunDump {
             addresses,
