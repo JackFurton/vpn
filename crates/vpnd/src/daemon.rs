@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
@@ -21,13 +22,13 @@ pub async fn up(
 
     let mut device = Device::new(iface.private_key.clone(), mtu);
     for p in &config.peers {
-        if p.persistent_keepalive.is_some() {
-            tracing::warn!(peer = ?p.public_key, "persistent_keepalive is not implemented yet and will be ignored");
-        }
         device.add_peer(PeerConfig {
             public_key: p.public_key.clone(),
             endpoint: p.endpoint,
             allowed_ips: p.allowed_ips.clone(),
+            persistent_keepalive: p
+                .persistent_keepalive
+                .map(|s| Duration::from_secs(s.into())),
         });
     }
 
