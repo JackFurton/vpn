@@ -24,7 +24,7 @@ or security group in front of the server.
 
 ```sh
 sudo mv server.toml /etc/vpnd/vpn0.toml   # root:root, mode 600
-sudo install -m 644 packaging/sysusers.d/vpnd.conf /etc/sysusers.d/
+sudo install -D -m 644 packaging/sysusers.d/vpnd.conf /etc/sysusers.d/vpnd.conf
 sudo systemd-sysusers
 sudo install -m 644 packaging/systemd/vpnd@.service /etc/systemd/system/
 sudo systemctl enable --now vpnd@vpn0

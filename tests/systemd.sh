@@ -48,7 +48,7 @@ endpoint = "127.0.0.1:51898"
 allowed_ips = ["10.99.0.0/24"]
 CONF
 chmod 600 /etc/vpnd/vpntest.toml
-install -m 644 "$REPO/packaging/sysusers.d/vpnd.conf" /etc/sysusers.d/
+install -D -m 644 "$REPO/packaging/sysusers.d/vpnd.conf" /etc/sysusers.d/vpnd.conf
 systemd-sysusers
 install -m 644 "$REPO/packaging/systemd/vpnd@.service" /etc/systemd/system/
 systemctl daemon-reload
