@@ -10,6 +10,9 @@ VPND=$(realpath "${1:?usage: bench.sh path/to/vpnd [seconds]}")
 SECS=${2:-10}
 [ "$(id -u)" = 0 ] || { echo "needs root" >&2; exit 1; }
 WORK=$(mktemp -d)
+# Ubuntu's AppArmor profile for wg only lets it read keys under /etc/wireguard.
+mkdir -p /etc/wireguard
+WGKEYS=$(mktemp -d /etc/wireguard/bench.XXXXXX)
 
 cleanup() {
   status=$?
@@ -18,7 +21,7 @@ cleanup() {
     ip netns pids $ns 2>/dev/null | xargs -r kill 2>/dev/null || true
     ip netns del $ns 2>/dev/null || true
   done
-  rm -rf "$WORK"
+  rm -rf "$WORK" "$WGKEYS"
   exit $status
 }
 trap cleanup EXIT
@@ -60,9 +63,9 @@ done
 for side in a b; do
   if [ $side = a ]; then priv=$a_priv peer=$b_pub n=1 m=2 endpoint=()
   else priv=$b_priv peer=$a_pub n=2 m=1 endpoint=(endpoint 172.31.0.1:51821); fi
-  echo "$priv" > "$WORK/wg-$side.key"
+  echo "$priv" > "$WGKEYS/$side.key"
   ip -n bench-$side link add wg0 type wireguard
-  ip netns exec bench-$side wg set wg0 listen-port 51821 private-key "$WORK/wg-$side.key" \
+  ip netns exec bench-$side wg set wg0 listen-port 51821 private-key "$WGKEYS/$side.key" \
     peer "$peer" allowed-ips 10.9.0.$m/32 "${endpoint[@]}"
   ip -n bench-$side addr add 10.9.0.$n/24 dev wg0
   ip -n bench-$side link set wg0 mtu 1420 up

@@ -20,8 +20,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq iperf3 wireguard-tools
       - run: cargo build --release -p vpnd --locked
-      - run: grep -rlE "profile wg[ ,]" /etc/apparmor.d | xargs -r cat
-      - run: sudo bash -x tests/bench.sh target/release/vpnd
-      - if: failure()
-        run: sudo dmesg | grep -i -E "apparmor|denied" | tail -20
+      - run: sudo tests/bench.sh target/release/vpnd
       - run: cargo bench -p vpn-proto --bench transport --locked
