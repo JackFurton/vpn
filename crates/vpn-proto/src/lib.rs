@@ -2,6 +2,7 @@
 //! Nothing in this crate touches sockets or TUN devices.
 
 pub mod handshake;
+pub mod ip;
 pub mod keys;
 pub mod replay;
 pub mod session;
