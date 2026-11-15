@@ -145,6 +145,17 @@ impl Tun {
         {
             rx.sizes[0] = self.dev.recv(&mut rx.bufs[0]).await?;
             rx.n = 1;
+            // One wakeup, then whatever else the kernel already queued.
+            while rx.n < BATCH {
+                match self.dev.try_recv(&mut rx.bufs[rx.n]) {
+                    Ok(len) => {
+                        rx.sizes[rx.n] = len;
+                        rx.n += 1;
+                    }
+                    // WouldBlock, or an error the next recv reports.
+                    Err(_) => break,
+                }
+            }
         }
         Ok(())
     }

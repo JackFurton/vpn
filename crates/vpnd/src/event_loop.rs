@@ -71,8 +71,8 @@ pub async fn run(
             r = udp.recv_batch(&mut udp_rx) => match r {
                 Ok(()) => {
                     let now = Instant::now();
-                    for datagram in udp_rx.datagrams() {
-                        device.handle_udp(datagram, udp_rx.from(), now, &mut out);
+                    for (from, datagram) in udp_rx.datagrams() {
+                        device.handle_udp(datagram, from, now, &mut out);
                     }
                 }
                 // Some platforms surface ICMP errors from earlier sends here.
