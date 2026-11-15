@@ -58,8 +58,17 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // TEMP A/B switch
+    let mut rt = if std::env::var_os("VPND_MULTI").is_some() {
+        tokio::runtime::Builder::new_multi_thread()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    rt.enable_all().build()?.block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     let logs = tracing_subscriber::fmt()
         .with_env_filter(
