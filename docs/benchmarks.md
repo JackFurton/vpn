@@ -20,7 +20,8 @@ both on a GitHub runner, on demand and on PRs that touch the benchmarks:
 https://github.com/JackFurton/vpn/actions/workflows/bench.yml
 
 Numbers below were recorded on 2026-11-14, after the switch to AWS-LC
-described at the end. Re-run before trusting them for anything newer.
+described at the end; the crypto pipeline (#70) is measured in its own
+section. Re-run before trusting them for anything newer.
 
 ## Protocol core
 
@@ -156,36 +157,27 @@ runner (2.2x kernel WireGuard there).
 
 ### Threads (#70)
 
-Spreading each batch's crypto across a thread pool (rayon, with the event
-loop thread taking a share) made things worse. With the RustCrypto code,
-on an 8-CPU Colima VM, one stream went 3.8, 3.3, 2.8 Gbit/s for 1, 4 and 8
-threads while using more CPU. A batch is about 80 us of crypto, and waking
-the pool and waiting for the slowest share cost more than it saved. On the
-4-CPU VM it can't help anyway: two vpnds and iperf3 already keep it 86%
-busy. Kernel WireGuard pipelines instead (workers encrypt while the sender
-keeps reading), which is what a second attempt would need.
+A first attempt split each batch's crypto across a rayon pool, with the
+event loop thread taking a share and waiting for the rest. It made things
+worse: on an 8-CPU Colima VM, one stream went 3.8, 3.3, 2.8 Gbit/s for 1,
+4 and 8 threads while using more CPU. Waking the pool and waiting for the
+slowest share cost more than the ~80 us of crypto in a batch.
 
-### macOS
+What works is a pipeline, the way kernel WireGuard and wireguard-go do it.
+`Device` prepares a batch (counters, headers, replay pre-checks) and leaves
+the cipher work in its `Outbox`; a worker thread runs it while the event
+loop goes back to reading; finished batches are completed (replay window,
+roaming, allowed-IPs check) and sent strictly in read order. The loop
+never waits for a worker. A handshake message that arrives while data
+ahead of it is still in flight is held and handled in order, so it can't
+replace a session that data was about to confirm.
 
-`bench-macos.sh` runs one vpnd against echo_peer on loopback and has a
-Python client bounce UDP off echo_peer's port 7 through the tunnel, so each
-datagram crosses vpnd once each way. On the macos-latest runner (3 vCPUs of
-an M1) vpnd moved about 23k echoes a second at 38 us of vpnd CPU per echo,
-nearly all of it syscalls and wakeups: in a `sample` profile, crypto barely
-registered next to `sendto`, `readv` on the utun, `kevent` and condvar
-waits.
+Small batches with nothing in flight stay inline, so an idle ping doesn't
+pay two thread wakeups: 50 to 60 us either way on the M5 VM. Only Linux
+uses workers. On macOS a wakeup brings a handful of packets, and handing
+those to a worker halved throughput on the runner.
 
-Two changes, measured against main in the same job since runners vary a
-lot from one to the next:
-
-- vpnd runs on tokio's current-thread runtime. On the multi-thread one a
-  worker polled kqueue and woke the event loop's thread through a condvar
-  for every batch. Linux didn't move either way.
-- Each wakeup reads every packet already queued on the utun and the UDP
-  socket, up to 64, before handling them, instead of one per wakeup.
-
-vpnd CPU per echo went from 38 to about 30 us. Throughput was 22.8 to
-31.7k echoes a second against main's 22.9 to 24.3k: vpnd sat around 77% of
-a core afterwards, so the Python client and echo_peer are the limit on that
-VM now. macOS has no public batched send or receive for UDP, so each packet
-still costs one syscall each way.
+M5 VM, one stream: 7.5 to 10.3 Gbit/s with 4 threads, kernel WireGuard at
+12 in the same runs. On a runner, where both vpnds and iperf3 already fill
+the 4 vCPUs, main against this in one job: 4.5 to 4.7 Gbit/s against 4.8
+to 5.3, about 12%, for nearly twice the CPU.

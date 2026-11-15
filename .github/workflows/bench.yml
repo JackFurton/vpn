@@ -23,18 +23,6 @@ jobs:
       - run: cargo build --release -p vpnd --locked
       - run: sudo tests/bench.sh target/release/vpnd
       - run: cargo bench -p vpn-proto --bench transport --locked
-      - name: TEMP A/B against main
-        run: |
-          git fetch -q origin main
-          git worktree add -q ../base origin/main
-          cargo build -q --release --locked --manifest-path ../base/Cargo.toml -p vpnd
-          for round in 1 2 3; do
-            for v in main branch; do
-              echo "### $v"
-              if [ $v = main ]; then bin=../base/target/release/vpnd; else bin=target/release/vpnd; fi
-              sudo tests/bench.sh $bin 8
-            done
-          done
 
   bench-macos:
     runs-on: macos-latest

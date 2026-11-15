@@ -81,10 +81,6 @@ pub async fn up(
     } else {
         1
     };
-    let threads = std::env::var("VPND_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(threads); // TEMP
     let result = event_loop::run(
         device,
         &tun,
