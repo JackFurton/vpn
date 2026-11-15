@@ -13,7 +13,7 @@ both on a GitHub runner, on demand and on PRs that touch the benchmarks:
 https://github.com/JackFurton/vpn/actions/workflows/bench.yml
 
 Numbers below were recorded on 2026-11-14: the protocol core at v0.2.0,
-the tunnels after #68. Re-run before trusting them for anything newer.
+the tunnels after the socket buffer change below. Re-run before trusting them for anything newer.
 
 ## Protocol core
 
@@ -59,12 +59,12 @@ Colima VM on an Apple M5, 4 CPUs, Linux 6.8:
 ```
 == TCP, one stream
 veth               121.21 Gbit/s
-vpnd                 2.37 Gbit/s   vpnd CPU: client 58%, server 60%
-kernel wireguard     8.03 Gbit/s
+vpnd                 3.98 Gbit/s   vpnd CPU: client 89%, server 97%
+kernel wireguard     8.08 Gbit/s
 == TCP, four streams
-veth               212.19 Gbit/s
-vpnd                 2.48 Gbit/s   vpnd CPU: client 68%, server 68%
-kernel wireguard     9.45 Gbit/s
+veth               253.83 Gbit/s
+vpnd                 4.09 Gbit/s   vpnd CPU: client 96%, server 100%
+kernel wireguard     8.56 Gbit/s
 ```
 
 GitHub ubuntu-latest runner, 4 vCPUs of an AMD EPYC 9V45, Linux 7.0 (azure):
@@ -104,11 +104,26 @@ Now, on Linux:
   merges into large TCP segments (GRO).
 
 Same 3 s on the receiving side afterwards: 22.8k `recvmsg`, 20.4k TUN
-writes, about 23 packets per syscall. Crypto (ChaCha20 plus Poly1305) is
-now about 70% of vpnd's CPU time, so the next limit is one core's worth of
-crypto (#70).
+writes, about 23 packets per syscall. Crypto (ChaCha20 plus Poly1305) went
+from a quarter of vpnd's CPU time to about 70%. That got the M5 VM to 2.37
+Gbit/s and the runner to 3.05.
 
 One trap: tun-rs only merges segments into a buffer that already has room
 for the result, and never reallocates. With buffers sized to one packet,
 nothing merged and every TUN write stayed 1430 bytes. Buffers now reserve
 64 KB.
+
+### Socket buffers
+
+After batching, neither vpnd was busy: each used about 57% of a core with
+the VM a third idle. The receiver's UDP socket was overflowing instead. In
+5 s of one stream, 201 `UdpRcvbufErrors` and 2256 TCP retransmits inside the
+tunnel. The default 208 KB buffer holds about three GSO bursts, so whenever
+the sender got ahead of decryption datagrams were dropped and TCP halved
+its window.
+
+vpnd now asks for 7 MB send and receive buffers (what wireguard-go uses),
+with SO_RCVBUFFORCE so `net.core.rmem_max` doesn't cap it while vpnd is
+still root. Same run afterwards: no drops, no retransmits, 2.37 to 3.98
+Gbit/s, and both ends at 90 to 100% of a core. From here one core of
+crypto is the limit (#70).

@@ -87,6 +87,7 @@ impl Udp {
         {
             tracing::debug!(%e, "UDP GRO unavailable");
         }
+        set_buffer_sizes(&socket);
         Self {
             socket,
             dual_stack,
@@ -246,6 +247,33 @@ fn bind_dual_stack(port: u16, mark: Option<u32>) -> io::Result<UdpSocket> {
     UdpSocket::from_std(socket.into())
 }
 
+/// The default (208 KB on Linux) holds about three GSO bursts, so a peer
+/// sending while we decrypt overflows it and TCP inside the tunnel backs
+/// off. Same size wireguard-go asks for.
+const SOCKET_BUFFER: usize = 7 << 20;
+
+fn set_buffer_sizes(socket: &UdpSocket) {
+    // The FORCE variants go past net.core.[rw]mem_max but need
+    // CAP_NET_ADMIN, which we still have here (privileges drop later).
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::socket::{setsockopt, sockopt};
+        let forced = setsockopt(&socket, sockopt::RcvBufForce, &SOCKET_BUFFER)
+            .and_then(|()| setsockopt(&socket, sockopt::SndBufForce, &SOCKET_BUFFER));
+        if forced.is_ok() {
+            return;
+        }
+    }
+    // Linux caps this at the sysctl maximums; macOS refuses past kern.ipc.maxsockbuf.
+    let socket = socket2::SockRef::from(socket);
+    let sized = socket
+        .set_recv_buffer_size(SOCKET_BUFFER)
+        .and_then(|()| socket.set_send_buffer_size(SOCKET_BUFFER));
+    if let Err(e) = sized {
+        tracing::debug!(%e, "keeping default UDP socket buffers");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn set_mark(socket: &Socket, mark: Option<u32>) -> io::Result<()> {
     mark.map_or(Ok(()), |m| socket.set_mark(m))
@@ -290,6 +318,16 @@ mod tests {
         let v6: SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
         assert_eq!(map(v6), v6);
         assert_eq!(unmap(v6), v6);
+    }
+
+    #[tokio::test]
+    async fn socket_buffers_grow_past_the_default() {
+        let udp = Udp::bind(0, None).unwrap();
+        let ours = socket2::SockRef::from(&udp.socket);
+        let fresh = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fresh = socket2::SockRef::from(&fresh);
+        assert!(ours.recv_buffer_size().unwrap() > fresh.recv_buffer_size().unwrap());
+        assert!(ours.send_buffer_size().unwrap() > fresh.send_buffer_size().unwrap());
     }
 
     #[tokio::test]
