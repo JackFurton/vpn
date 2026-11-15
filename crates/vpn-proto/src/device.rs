@@ -14,6 +14,7 @@ use tracing::{debug, trace};
 
 use crate::allowed_ips::AllowedIps;
 use crate::cookie::{COOKIE_USE_LIFETIME, Cookie, CookieJar, MacKeys};
+use crate::crypt::Crypt;
 use crate::handshake::{HandshakeError, InitReceived, Initiator, Tai64N, read_init};
 use crate::ip::IpHeader;
 use crate::keys::{PrivateKey, PublicKey};
@@ -186,6 +187,37 @@ pub enum Dest {
 pub struct Outbox {
     buf: Vec<u8>,
     items: Vec<(Dest, Range<usize>)>,
+    /// Work `Device::finish` still has to do, in arrival order. Empty
+    /// after `finish`, and always empty from `handle_*` and `tick`.
+    pending: Vec<Pending>,
+    /// Whether `run_crypto` has run over `pending`.
+    crypto_done: bool,
+    /// Counted in `Device::unfinished`.
+    counted: bool,
+    /// Bytes of held-back messages.
+    held: Vec<u8>,
+}
+
+enum Pending {
+    /// The cipher work for an item. `open` is set for received data.
+    Crypto {
+        item: usize,
+        crypt: Crypt,
+        ok: bool,
+        open: Option<Received>,
+    },
+    /// A handshake or cookie message that arrived while data was still
+    /// waiting on crypto, held so it's handled in arrival order.
+    Message {
+        from: SocketAddr,
+        bytes: Range<usize>,
+    },
+}
+
+struct Received {
+    index: u32,
+    from: SocketAddr,
+    wire_len: usize,
 }
 
 impl Outbox {
@@ -194,6 +226,7 @@ impl Outbox {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Dest, &[u8])> {
+        assert!(self.pending.is_empty(), "output before Device::finish");
         self.items.iter().map(|(d, r)| (*d, &self.buf[r.clone()]))
     }
 
@@ -204,6 +237,7 @@ impl Outbox {
         &self,
         max_segments: usize,
     ) -> impl Iterator<Item = (SocketAddr, &[u8], usize)> {
+        assert!(self.pending.is_empty(), "output before Device::finish");
         let mut items = self.items.iter().peekable();
         std::iter::from_fn(move || {
             let (to, first) = loop {
@@ -240,6 +274,41 @@ impl Outbox {
     pub fn clear(&mut self) {
         self.buf.clear();
         self.items.clear();
+        self.pending.clear();
+        self.held.clear();
+        self.crypto_done = false;
+        assert!(!self.counted, "cleared an Outbox that was never finished");
+    }
+
+    /// Whether `Device::finish` has work here. When it doesn't, the output
+    /// is ready as it is.
+    pub fn needs_finish(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Bytes waiting on encryption or decryption.
+    pub fn crypto_bytes(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|p| match p {
+                Pending::Crypto { item, .. } => self.items[*item].1.len(),
+                Pending::Message { .. } => 0,
+            })
+            .sum()
+    }
+
+    /// Does every encryption and decryption `Device` left here. Touches
+    /// nothing but this `Outbox`, so it can run on any thread.
+    pub fn run_crypto(&mut self) {
+        for p in &mut self.pending {
+            if let Pending::Crypto {
+                item, crypt, ok, ..
+            } = p
+            {
+                *ok = crypt.run(&mut self.buf[self.items[*item].1.clone()]);
+            }
+        }
+        self.crypto_done = true;
     }
 
     /// Reserves `max` bytes, lets `write` fill a prefix of them, and keeps
@@ -265,10 +334,34 @@ impl Outbox {
         }
     }
 
-    fn pop(&mut self) {
-        if let Some((_, r)) = self.items.pop() {
-            self.buf.truncate(r.start);
-        }
+    /// Leaves `crypt` to run over the item just pushed.
+    fn defer(&mut self, crypt: Crypt, open: Option<Received>) {
+        self.crypto_done = false;
+        self.pending.push(Pending::Crypto {
+            item: self.items.len() - 1,
+            crypt,
+            ok: false,
+            open,
+        });
+    }
+
+    fn hold(&mut self, datagram: &[u8], from: SocketAddr) {
+        let start = self.held.len();
+        self.held.extend_from_slice(datagram);
+        self.pending.push(Pending::Message {
+            from,
+            bytes: start..self.held.len(),
+        });
+    }
+
+    /// Marks an item dropped; `compact` removes it.
+    fn discard(&mut self, item: usize) {
+        let r = &mut self.items[item].1;
+        r.end = r.start;
+    }
+
+    fn compact(&mut self) {
+        self.items.retain(|(_, r)| !r.is_empty());
     }
 }
 
@@ -420,6 +513,11 @@ pub struct Device {
     by_index: HashMap<u32, usize>,
     /// Set when any peer's endpoint moves, for `take_endpoints_changed`.
     endpoints_changed: bool,
+    /// Reused by `finish` so steady state doesn't allocate.
+    settling: Vec<Pending>,
+    /// Outboxes prepared but not yet finished. While there are any, a
+    /// handshake message waits its turn behind them.
+    unfinished: usize,
 }
 
 /// Points `endpoint` at `to`, returning whether it moved.
@@ -448,6 +546,8 @@ impl Device {
             by_key: HashMap::new(),
             by_index: HashMap::new(),
             endpoints_changed: false,
+            settling: Vec::new(),
+            unfinished: 0,
         }
     }
 
@@ -512,6 +612,26 @@ impl Device {
 
     /// An outbound IP packet the kernel routed into the tunnel.
     pub fn handle_tun(&mut self, packet: &[u8], now: Instant, out: &mut Outbox) {
+        self.prepare_tun([packet], now, out);
+        out.run_crypto();
+        self.finish(now, out);
+    }
+
+    /// Like `handle_tun` for many packets, but leaves the encryption in
+    /// `out` for `Outbox::run_crypto` and the rest for `finish`.
+    pub fn prepare_tun<'a>(
+        &mut self,
+        packets: impl IntoIterator<Item = &'a [u8]>,
+        now: Instant,
+        out: &mut Outbox,
+    ) {
+        for packet in packets {
+            self.tun_packet(packet, now, out);
+        }
+        self.count(out);
+    }
+
+    fn tun_packet(&mut self, packet: &[u8], now: Instant, out: &mut Outbox) {
         let Some(h) = IpHeader::parse(packet) else {
             debug!(len = packet.len(), "dropping non-IP packet from TUN");
             self.drops.add(DropReason::NotIp, 1);
@@ -535,6 +655,73 @@ impl Device {
         now: Instant,
         out: &mut Outbox,
     ) {
+        self.prepare_udp([(from, datagram)], now, out);
+        out.run_crypto();
+        self.finish(now, out);
+    }
+
+    /// Like `handle_udp` for many datagrams, but leaves the decryption in
+    /// `out` for `Outbox::run_crypto` and the rest for `finish`.
+    pub fn prepare_udp<'a>(
+        &mut self,
+        datagrams: impl IntoIterator<Item = (SocketAddr, &'a [u8])>,
+        now: Instant,
+        out: &mut Outbox,
+    ) {
+        for (from, datagram) in datagrams {
+            match Message::parse(datagram) {
+                Ok(Message::Data(d)) => self.on_data(&d, from, now, out),
+                // Data ahead of this one, here or in another Outbox, is
+                // finished first, so a handshake sees the state it would
+                // if every datagram ran start to end.
+                _ if self.unfinished > 0 || out.needs_finish() => out.hold(datagram, from),
+                _ => self.udp_datagram(datagram, from, now, out),
+            }
+        }
+        self.count(out);
+    }
+
+    fn count(&mut self, out: &mut Outbox) {
+        if out.needs_finish() && !out.counted {
+            out.counted = true;
+            self.unfinished += 1;
+        }
+    }
+
+    /// Completes what `prepare_*` left in `out`, once `run_crypto` has run:
+    /// received data is checked and delivered, held messages are handled,
+    /// all in arrival order. Anything that queues more to encrypt (a
+    /// handshake completing flushes its queue) is encrypted here.
+    pub fn finish(&mut self, now: Instant, out: &mut Outbox) {
+        while out.needs_finish() {
+            assert!(out.crypto_done, "Device::finish before Outbox::run_crypto");
+            let mut done = std::mem::take(&mut self.settling);
+            std::mem::swap(&mut done, &mut out.pending);
+            for p in done.drain(..) {
+                match p {
+                    Pending::Crypto {
+                        item,
+                        crypt,
+                        ok,
+                        open: Some(received),
+                    } => self.finish_data(item, &crypt, ok, &received, now, out),
+                    Pending::Crypto { open: None, .. } => {}
+                    Pending::Message { from, bytes } => {
+                        let datagram = out.held[bytes].to_vec();
+                        self.udp_datagram(&datagram, from, now, out);
+                    }
+                }
+            }
+            self.settling = done;
+            out.run_crypto();
+        }
+        out.compact();
+        if std::mem::take(&mut out.counted) {
+            self.unfinished -= 1;
+        }
+    }
+
+    fn udp_datagram(&mut self, datagram: &[u8], from: SocketAddr, now: Instant, out: &mut Outbox) {
         match Message::parse(datagram) {
             // mac1 is one cheap hash, so junk dies here before any DH.
             Ok(Message::HandshakeInit(_) | Message::HandshakeResponse(_))
@@ -642,6 +829,8 @@ impl Device {
         let peers = &self.peers;
         self.by_index
             .retain(|&index, &mut i| peers[i].owns_index(index));
+        out.run_crypto();
+        self.finish(now, out);
     }
 
     fn route(&self, dst: IpAddr) -> Option<usize> {
@@ -654,9 +843,16 @@ impl Device {
         let usable = peer.current.as_mut().filter(|s| !s.expired(now));
         if let (Some(slot), Some(ep)) = (usable, peer.endpoint) {
             let max = Session::encrypted_len(packet.len(), mtu);
-            match out.push(Dest::Udp(ep), max, |b| slot.session.encrypt(packet, mtu, b)) {
+            let mut seal = None;
+            let pushed = out.push(Dest::Udp(ep), max, |b| {
+                let (n, s) = slot.session.prepare_seal(packet, mtu, b)?;
+                seal = Some(s);
+                Ok::<_, TransportError>(n)
+            });
+            match pushed.map(<[u8]>::len) {
                 Ok(sent) => {
-                    peer.counters.tx_bytes += sent.len() as u64;
+                    out.defer(seal.expect("set on success"), None);
+                    peer.counters.tx_bytes += sent as u64;
                     peer.counters.tx_packets += 1;
                     let rekey = (slot.we_initiated && slot.age(now) >= REKEY_AFTER_TIME)
                         || slot.session.send_counter >= REKEY_AFTER_MESSAGES;
@@ -690,11 +886,17 @@ impl Device {
         // debt either way so the timer doesn't fire every tick.
         peer.owe_keepalive = None;
         let usable = peer.current.as_mut().filter(|s| !s.expired(now));
+        let mut seal = None;
         if let (Some(slot), Some(ep)) = (usable, peer.endpoint)
             && out
-                .push(Dest::Udp(ep), DATA_MIN_LEN, |b| slot.session.keepalive(b))
+                .push(Dest::Udp(ep), DATA_MIN_LEN, |b| {
+                    let (n, s) = slot.session.prepare_seal(&[], 0, b)?;
+                    seal = Some(s);
+                    Ok::<_, TransportError>(n)
+                })
                 .is_ok()
         {
+            out.defer(seal.expect("set on success"), None);
             peer.counters.tx_bytes += DATA_MIN_LEN as u64;
             peer.counters.tx_packets += 1;
             peer.mark_sent(now, false);
@@ -887,58 +1089,113 @@ impl Device {
         }
     }
 
+    /// Copies a data message into `out` for decryption. `finish_data` does
+    /// the rest once the batch is decrypted.
     fn on_data(&mut self, d: &Data, from: SocketAddr, now: Instant, out: &mut Outbox) {
-        let found = self
-            .by_index
-            .get(&d.receiver_index)
-            .and_then(|&i| self.peers[i].find(d.receiver_index).map(|w| (i, w)));
-        let Some((i, which)) = found else {
+        let Some((i, which)) = self.find_session(d.receiver_index) else {
             trace!(index = d.receiver_index, "data for unknown session");
             self.drops.add(DropReason::UnknownSession, 1);
             return;
         };
-        let peer = &mut self.peers[i];
-        let slot = peer.slot(which).as_mut().expect("found above");
+        let slot = self.peers[i].slot(which).as_ref().expect("found above");
         if slot.expired(now) {
             trace!("data for expired session");
             self.drops.add(DropReason::ExpiredSession, 1);
             return;
         }
+        let open = match slot.session.prepare_open(d) {
+            Ok(open) => open,
+            Err(e) => return self.drop_data(e),
+        };
+        let _ = out.push(Dest::Tun, d.ciphertext.len(), |b| {
+            b.copy_from_slice(d.ciphertext);
+            Ok::<_, ()>(b.len())
+        });
+        let received = Received {
+            index: d.receiver_index,
+            from,
+            wire_len: DATA_HEADER_LEN + d.ciphertext.len(),
+        };
+        out.defer(open, Some(received));
+    }
+
+    fn find_session(&self, index: u32) -> Option<(usize, Which)> {
+        let &i = self.by_index.get(&index)?;
+        Some((i, self.peers[i].find(index)?))
+    }
+
+    fn drop_data(&mut self, e: TransportError) {
+        trace!(%e, "dropping data");
+        self.drops.add(
+            match e {
+                TransportError::Replay => DropReason::Replay,
+                TransportError::InvalidInnerPacket => DropReason::InvalidInnerPacket,
+                _ => DropReason::AuthFailed,
+            },
+            1,
+        );
+    }
+
+    fn finish_data(
+        &mut self,
+        item: usize,
+        crypt: &Crypt,
+        ok: bool,
+        received: &Received,
+        now: Instant,
+        out: &mut Outbox,
+    ) {
+        let Received {
+            index,
+            from,
+            wire_len,
+        } = *received;
+        // The session can be gone or replaced if a handshake in the same
+        // batch rotated it.
+        let found = self.find_session(index).filter(|&(i, which)| {
+            self.peers[i]
+                .slot(which)
+                .as_ref()
+                .is_some_and(|slot| slot.session.issued(crypt))
+        });
+        let Some((i, which)) = found else {
+            trace!(index, "data for a session replaced mid-batch");
+            self.drops.add(DropReason::UnknownSession, 1);
+            return out.discard(item);
+        };
+        if !ok {
+            self.drop_data(TransportError::Decrypt);
+            return out.discard(item);
+        }
+        let peer = &mut self.peers[i];
+        let slot = peer.slot(which).as_mut().expect("found above");
         let rekey_on_receive = matches!(which, Which::Current)
             && slot.we_initiated
             && slot.age(now) >= REKEY_ON_RECEIVE_AGE;
-
-        let max = d.ciphertext.len().saturating_sub(TAG_LEN);
-        let packet = match out.push(Dest::Tun, max, |b| {
-            slot.session.decrypt(d, b).map(<[u8]>::len)
-        }) {
-            Ok(p) => p,
+        let r = out.items[item].1.clone();
+        let plaintext = &out.buf[r.start..r.end - TAG_LEN];
+        let len = match slot.session.finish_open(crypt, plaintext) {
+            Ok(packet) => packet.len(),
             Err(e) => {
-                trace!(%e, "dropping data");
-                self.drops.add(
-                    match e {
-                        TransportError::Replay => DropReason::Replay,
-                        TransportError::InvalidInnerPacket => DropReason::InvalidInnerPacket,
-                        _ => DropReason::AuthFailed,
-                    },
-                    1,
-                );
-                return;
+                self.drop_data(e);
+                return out.discard(item);
             }
         };
-        peer.counters.rx_bytes += (DATA_HEADER_LEN + d.ciphertext.len()) as u64;
+        out.items[item].1.end = r.start + len;
+        let packet = &out.buf[r.start..r.start + len];
+        peer.counters.rx_bytes += wire_len as u64;
         peer.counters.rx_packets += 1;
         let is_data = !packet.is_empty();
         // Cryptokey routing: the source must be an address we'd route back
         // to this same peer.
         let allowed =
             IpHeader::parse(packet).is_some_and(|h| self.routes.lookup(h.src) == Some(&i));
+        if is_data && !allowed {
+            debug!(peer = ?peer.public_key, "dropping packet from a source outside allowed_ips");
+            self.drops.add(DropReason::SourceNotAllowed, 1);
+        }
         if !is_data || !allowed {
-            if is_data {
-                debug!(peer = ?peer.public_key, "dropping packet from a source outside allowed_ips");
-                self.drops.add(DropReason::SourceNotAllowed, 1);
-            }
-            out.pop();
+            out.discard(item);
         }
         peer.mark_received(now, is_data);
         // Roaming: the packet authenticated and passed the replay window, so
@@ -1634,5 +1891,105 @@ mod tests {
 
         net.tick_a(REJECT_AFTER_TIME);
         assert!(net.a.by_index.is_empty(), "expired sessions swept");
+    }
+
+    /// A's encrypted datagrams for `packets`, not delivered.
+    fn seal_batch(net: &mut Net, packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut out = Outbox::new();
+        net.a
+            .prepare_tun(packets.iter().map(Vec::as_slice), net.now, &mut out);
+        out.run_crypto();
+        net.a.finish(net.now, &mut out);
+        out.iter().map(|(_, b)| b.to_vec()).collect()
+    }
+
+    /// Delivers `batches` to B the way a pipeline would: every batch
+    /// prepared before any crypto runs, crypto run last batch first, then
+    /// finished in order. Returns what reached B's TUN.
+    fn open_pipelined(net: &mut Net, batches: &[&[Vec<u8>]]) -> Vec<Vec<u8>> {
+        let mut outs: Vec<Outbox> = batches.iter().map(|_| Outbox::new()).collect();
+        for (batch, out) in batches.iter().zip(&mut outs) {
+            let datagrams = batch.iter().map(|d| (A, d.as_slice()));
+            net.b.prepare_udp(datagrams, net.now, out);
+        }
+        outs.iter_mut().rev().for_each(Outbox::run_crypto);
+        let mut tun = vec![];
+        for out in &mut outs {
+            net.b.finish(net.now, out);
+            tun.extend(
+                out.iter()
+                    .filter(|&(d, _)| d == Dest::Tun)
+                    .map(|(_, b)| b.to_vec()),
+            );
+        }
+        tun
+    }
+
+    #[test]
+    fn batches_finish_in_order_whatever_order_the_crypto_runs() {
+        let mut net = Net::new();
+        net.send_a(&to_b(0));
+        let packets: Vec<_> = (1..=20).map(to_b).collect();
+        let wire = seal_batch(&mut net, &packets);
+        assert_eq!(wire.len(), 20);
+        let batches: Vec<&[Vec<u8>]> = wire.chunks(7).collect();
+        assert_eq!(open_pipelined(&mut net, &batches), packets);
+    }
+
+    #[test]
+    fn duplicates_and_forgeries_in_flight_drop_alone() {
+        let mut net = Net::new();
+        net.send_a(&to_b(0));
+        let mut wire = seal_batch(&mut net, &[to_b(1), to_b(2), to_b(3)]);
+        let mut forged = wire[1].clone();
+        *forged.last_mut().unwrap() ^= 1;
+        wire.insert(1, forged);
+        // A duplicate in the same batch, and one in a later batch.
+        wire.push(wire[0].clone());
+        let later = [wire[2].clone()];
+        let tun = open_pipelined(&mut net, &[&wire, &later]);
+        assert_eq!(tun, [to_b(1), to_b(2), to_b(3)]);
+        assert_eq!(drops(&net.b, DropReason::AuthFailed), 1);
+        assert_eq!(drops(&net.b, DropReason::Replay), 2);
+    }
+
+    #[test]
+    fn first_batch_on_a_new_session_all_arrives() {
+        let mut net = Net::new();
+        // Handshake completes but A's data is lost, so B's session is still
+        // waiting for confirmation.
+        net.drop_types = vec![4];
+        net.send_a(&to_b(0));
+        net.drop_types.clear();
+        let packets: Vec<_> = (1..=5).map(to_b).collect();
+        let wire = seal_batch(&mut net, &packets);
+        // The first packet promotes the session, which moves it to another
+        // slot before the rest are finished.
+        assert_eq!(open_pipelined(&mut net, &[&wire[..2], &wire[2..]]), packets);
+        assert_eq!(net.b.stats(net.now).peers[0].counters.handshakes, 1);
+    }
+
+    /// B's session is still unconfirmed (A's data got lost), and A has data
+    /// for it plus a fresh initiation. Handled out of order, the init would
+    /// replace that session before the data confirms it.
+    fn data_then_init() -> (Net, Vec<u8>, Vec<u8>) {
+        let mut net = Net::new();
+        net.drop_types = vec![4];
+        net.send_a(&to_b(0));
+        net.drop_types.clear();
+        let data = seal_batch(&mut net, &[to_b(1)]).remove(0);
+        let mut out = Outbox::new();
+        net.a.initiate(0, net.now, &mut out);
+        let init = out.iter().next().unwrap().1.to_vec();
+        (net, data, init)
+    }
+
+    #[test]
+    fn a_handshake_waits_for_data_ahead_of_it() {
+        let (mut net, data, init) = data_then_init();
+        assert_eq!(open_pipelined(&mut net, &[&[data, init]]), [to_b(1)]);
+        // Same, with the init in the next batch while the first is in flight.
+        let (mut net, data, init) = data_then_init();
+        assert_eq!(open_pipelined(&mut net, &[&[data], &[init]]), [to_b(1)]);
     }
 }

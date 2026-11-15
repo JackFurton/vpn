@@ -3,6 +3,7 @@
 
 pub mod allowed_ips;
 pub mod cookie;
+pub mod crypt;
 pub mod device;
 pub mod handshake;
 pub mod ip;

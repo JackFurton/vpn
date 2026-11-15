@@ -1,9 +1,12 @@
 //! An established session: encrypts outgoing IP packets into data messages and
 //! authenticates incoming ones, in the order docs/protocol.md requires.
 
-use aws_lc_rs::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+use std::sync::Arc;
+
+use aws_lc_rs::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, UnboundKey};
 use zeroize::Zeroizing;
 
+use crate::crypt::{Crypt, Kind, nonce};
 use crate::replay::{REJECT_AFTER_MESSAGES, ReplayWindow};
 use crate::wire::{BufferTooSmall, DATA_HEADER_LEN, Data, TAG_LEN, encode_data_header};
 
@@ -45,9 +48,10 @@ pub struct Session {
     /// Index the peer chose. We address packets to them with it.
     pub remote_index: u32,
     // AWS-LC keeps each key in a context it allocated, and its allocator
-    // cleanses memory on free, so dropping these wipes the keys.
-    send: LessSafeKey,
-    recv: LessSafeKey,
+    // cleanses memory on free, so dropping these wipes the keys. Shared
+    // with in-flight crypto jobs, so the last of those drops them.
+    send: Arc<LessSafeKey>,
+    recv: Arc<LessSafeKey>,
     pub(crate) send_counter: u64,
     replay: ReplayWindow,
     confirmed: bool,
@@ -59,16 +63,9 @@ pub(crate) struct Keys {
     pub recv: Zeroizing<[u8; 32]>,
 }
 
-/// Same layout snow uses, which keeps the wire format unchanged: 4 zero
-/// bytes, then the counter little-endian.
-fn nonce(counter: u64) -> Nonce {
-    let mut n = [0u8; 12];
-    n[4..].copy_from_slice(&counter.to_le_bytes());
-    Nonce::assume_unique_for_key(n)
-}
-
-fn key(bytes: &[u8; 32]) -> LessSafeKey {
-    LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, bytes).expect("32-byte key"))
+fn key(bytes: &[u8; 32]) -> Arc<LessSafeKey> {
+    let key = UnboundKey::new(&CHACHA20_POLY1305, bytes).expect("32-byte key");
+    Arc::new(LessSafeKey::new(key))
 }
 
 impl Session {
@@ -103,6 +100,19 @@ impl Session {
         mtu: usize,
         out: &mut [u8],
     ) -> Result<usize, TransportError> {
+        let (len, seal) = self.prepare_seal(packet, mtu, out)?;
+        seal.run(&mut out[..len]);
+        Ok(len)
+    }
+
+    /// `encrypt` up to the cipher: header, padded plaintext and a counter
+    /// written to `out`, and the job that seals it.
+    pub(crate) fn prepare_seal(
+        &mut self,
+        packet: &[u8],
+        mtu: usize,
+        out: &mut [u8],
+    ) -> Result<(usize, Crypt), TransportError> {
         if !self.confirmed {
             return Err(TransportError::NotConfirmed);
         }
@@ -125,19 +135,18 @@ impl Session {
             .split_first_chunk_mut()
             .expect("len includes the header");
         encode_data_header(self.remote_index, counter, header);
-
-        // Encrypt in place: the padded plaintext goes where the ciphertext
-        // will be, so the packet is copied exactly once.
-        let (body, tag_out) = body.split_at_mut(padded_len(packet.len(), mtu));
+        // The padded plaintext goes where the ciphertext will be and is
+        // encrypted in place, so the packet is copied exactly once.
+        let body = &mut body[..padded_len(packet.len(), mtu)];
         body[..packet.len()].copy_from_slice(packet);
         body[packet.len()..].fill(0);
-        let tag = self
-            .send
-            .seal_in_place_separate_tag(nonce(counter), Aad::empty(), body)
-            .map_err(|_| TransportError::Encrypt)?;
-        tag_out.copy_from_slice(tag.as_ref());
         self.send_counter += 1;
-        Ok(len)
+        let seal = Crypt {
+            key: Arc::clone(&self.send),
+            counter,
+            kind: Kind::Seal,
+        };
+        Ok((len, seal))
     }
 
     pub fn keepalive(&mut self, out: &mut [u8]) -> Result<usize, TransportError> {
@@ -151,6 +160,21 @@ impl Session {
         msg: &Data,
         out: &'a mut [u8],
     ) -> Result<&'a [u8], TransportError> {
+        let open = self.prepare_open(msg)?;
+        let (ciphertext, tag) = msg.ciphertext.split_at(msg.ciphertext.len() - TAG_LEN);
+        let need = ciphertext.len();
+        let got = out.len();
+        let out = out.get_mut(..need).ok_or(BufferTooSmall { need, got })?;
+        // Decrypts straight from the datagram into `out`, no copy first.
+        self.recv
+            .open_separate_gather(nonce(msg.counter), Aad::empty(), ciphertext, tag, out)
+            .map_err(|_| TransportError::Decrypt)?;
+        self.finish_open(&open, out)
+    }
+
+    /// The checks before decrypting: right session, and a counter the
+    /// replay window could still take.
+    pub(crate) fn prepare_open(&self, msg: &Data) -> Result<Crypt, TransportError> {
         if msg.receiver_index != self.local_index {
             return Err(TransportError::WrongIndex {
                 expected: self.local_index,
@@ -160,23 +184,32 @@ impl Session {
         if !self.replay.may_accept(msg.counter) {
             return Err(TransportError::Replay);
         }
+        Ok(Crypt {
+            key: Arc::clone(&self.recv),
+            counter: msg.counter,
+            kind: Kind::Open,
+        })
+    }
 
-        let (ciphertext, tag) = msg.ciphertext.split_at(msg.ciphertext.len() - TAG_LEN);
-        let need = ciphertext.len();
-        let got = out.len();
-        let out = out.get_mut(..need).ok_or(BufferTooSmall { need, got })?;
-        // Decrypts straight from the datagram into `out`, no copy first.
-        self.recv
-            .open_separate_gather(nonce(msg.counter), Aad::empty(), ciphertext, tag, out)
-            .map_err(|_| TransportError::Decrypt)?;
-
+    /// After `open` authenticated `plaintext`.
+    pub(crate) fn finish_open<'a>(
+        &mut self,
+        open: &Crypt,
+        plaintext: &'a [u8],
+    ) -> Result<&'a [u8], TransportError> {
         // Only now is the counter trustworthy enough to move the window.
-        if !self.replay.accept(msg.counter) {
+        // Another copy may have got here first since `prepare_open`.
+        if !self.replay.accept(open.counter) {
             return Err(TransportError::Replay);
         }
         self.confirmed = true;
-        let out: &'a [u8] = out;
-        strip_padding(out)
+        strip_padding(plaintext)
+    }
+
+    /// Whether `open` came from this session's `prepare_open`. Sessions can
+    /// be replaced between preparing a packet and finishing it.
+    pub(crate) fn issued(&self, open: &Crypt) -> bool {
+        Arc::ptr_eq(&self.recv, &open.key)
     }
 }
 
