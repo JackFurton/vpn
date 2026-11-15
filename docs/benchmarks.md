@@ -8,6 +8,13 @@ cargo bench -p vpn-proto --bench transport
 cargo build --release -p vpnd && sudo tests/bench.sh target/release/vpnd
 ```
 
+On macOS, where there are no namespaces:
+
+```sh
+cargo build --release -p vpnd --bins --examples
+sudo tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer
+```
+
 `bench.sh` needs iperf3, wireguard-tools and python3. The Bench workflow runs
 both on a GitHub runner, on demand and on PRs that touch the benchmarks:
 https://github.com/JackFurton/vpn/actions/workflows/bench.yml
@@ -157,3 +164,28 @@ the pool and waiting for the slowest share cost more than it saved. On the
 4-CPU VM it can't help anyway: two vpnds and iperf3 already keep it 86%
 busy. Kernel WireGuard pipelines instead (workers encrypt while the sender
 keeps reading), which is what a second attempt would need.
+
+### macOS
+
+`bench-macos.sh` runs one vpnd against echo_peer on loopback and has a
+Python client bounce UDP off echo_peer's port 7 through the tunnel, so each
+datagram crosses vpnd once each way. On the macos-latest runner (3 vCPUs of
+an M1) vpnd moved about 23k echoes a second at 38 us of vpnd CPU per echo,
+nearly all of it syscalls and wakeups: in a `sample` profile, crypto barely
+registered next to `sendto`, `readv` on the utun, `kevent` and condvar
+waits.
+
+Two changes, measured against main in the same job since runners vary a
+lot from one to the next:
+
+- vpnd runs on tokio's current-thread runtime. On the multi-thread one a
+  worker polled kqueue and woke the event loop's thread through a condvar
+  for every batch. Linux didn't move either way.
+- Each wakeup reads every packet already queued on the utun and the UDP
+  socket, up to 64, before handling them, instead of one per wakeup.
+
+vpnd CPU per echo went from 38 to about 30 us. Throughput was 22.8 to
+31.7k echoes a second against main's 22.9 to 24.3k: vpnd sat around 77% of
+a core afterwards, so the Python client and echo_peer are the limit on that
+VM now. macOS has no public batched send or receive for UDP, so each packet
+still costs one syscall each way.

@@ -58,17 +58,11 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
-    // TEMP A/B switch
-    let mut rt = if std::env::var_os("VPND_MULTI").is_some() {
-        tokio::runtime::Builder::new_multi_thread()
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-    };
-    rt.enable_all().build()?.block_on(run())
-}
-
-async fn run() -> Result<()> {
+// One thread: the event loop is the only busy task. On a multi-thread
+// runtime a worker polls kqueue and wakes the loop's thread through a condvar
+// for every batch, which cost macOS about a fifth of vpnd's CPU per packet.
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let logs = tracing_subscriber::fmt()
         .with_env_filter(
