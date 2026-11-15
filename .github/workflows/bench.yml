@@ -32,12 +32,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p vpnd --bins --examples --locked
       - run: sudo tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer
-      - name: TEMP A/B runtime
+      - name: TEMP A/B against main
         run: |
-          for round in 1 2; do
-            for rt in multi current; do
-              echo "### $rt"
-              if [ $rt = multi ]; then sudo VPND_MULTI=1 tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer 8
-              else sudo tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer 8; fi
+          git fetch -q origin main
+          git worktree add -q ../base origin/main
+          cargo build -q --release --locked --manifest-path ../base/Cargo.toml -p vpnd --bins
+          for round in 1 2 3; do
+            for v in main branch; do
+              echo "### $v"
+              if [ $v = main ]; then bin=../base/target/release/vpnd; else bin=target/release/vpnd; fi
+              sudo tests/bench-macos.sh $bin target/release/examples/echo_peer 8
             done
           done
