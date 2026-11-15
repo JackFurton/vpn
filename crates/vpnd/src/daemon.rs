@@ -73,7 +73,19 @@ pub async fn up(
     let dns = crate::dns::apply(&iface.dns, tun.name())?;
     crate::privdrop::drop_privileges(user)?;
     let on_endpoints = |eps| installed.update_endpoints(eps);
-    let result = event_loop::run(device, &tun, &udp, mtu, metrics, on_endpoints, shutdown).await;
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    let threads = std::env::var("VPND_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(threads); // TEMP
+    let result = event_loop::run(
+        device,
+        &tun,
+        &udp,
+        mtu,
+        threads,
+        metrics,
+        on_endpoints,
+        shutdown,
+    )
+    .await;
     installed.remove();
     dns.remove();
     result?;

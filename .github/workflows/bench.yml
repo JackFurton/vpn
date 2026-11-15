@@ -32,3 +32,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p vpnd --bins --examples --locked
       - run: sudo tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer
+      - name: TEMP A/B threads
+        run: |
+          for round in 1 2; do
+            for t in 1 3; do
+              echo "### threads=$t"
+              sudo VPND_THREADS=$t tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer 8
+            done
+          done
