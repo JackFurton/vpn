@@ -10,6 +10,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::ops::Range;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
@@ -30,33 +31,40 @@ const GSO_MAX_SEGMENTS: usize = 64;
 #[cfg(target_os = "linux")]
 const GSO_MAX_BYTES: usize = 65_000;
 
-/// What one receive returned: a single datagram, or with GRO several from
-/// the same sender packed `stride` bytes apart (the last may be shorter).
+const MAX_DATAGRAM: usize = 65_535;
+/// Without GRO, datagrams already queued when we wake are read one by one
+/// up to this many, so one wakeup still handles a burst.
+#[cfg(not(target_os = "linux"))]
+const DRAIN: usize = 64;
+
+/// What one wakeup received. With GRO that's one read of several datagrams
+/// from one sender; elsewhere, separate reads of whatever was queued.
 pub struct UdpRx {
     buf: Vec<u8>,
-    len: usize,
-    stride: usize,
-    from: SocketAddr,
+    datagrams: Vec<(SocketAddr, Range<usize>)>,
 }
 
 impl Default for UdpRx {
     fn default() -> Self {
+        // Room for four maximum-size datagrams, so draining never has to
+        // read into a buffer that could truncate one.
+        let len = if cfg!(target_os = "linux") {
+            MAX_DATAGRAM
+        } else {
+            4 * MAX_DATAGRAM
+        };
         Self {
-            buf: vec![0; 65_535],
-            len: 0,
-            stride: 0,
-            from: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            buf: vec![0; len],
+            datagrams: Vec::new(),
         }
     }
 }
 
 impl UdpRx {
-    pub fn from(&self) -> SocketAddr {
-        self.from
-    }
-
-    pub fn datagrams(&self) -> impl Iterator<Item = &[u8]> {
-        self.buf[..self.len].chunks(self.stride.max(1))
+    pub fn datagrams(&self) -> impl Iterator<Item = (SocketAddr, &[u8])> {
+        self.datagrams
+            .iter()
+            .map(|(from, r)| (*from, &self.buf[r.clone()]))
     }
 }
 
@@ -112,21 +120,42 @@ impl Udp {
     }
 
     pub async fn recv_batch(&self, rx: &mut UdpRx) -> io::Result<()> {
+        rx.datagrams.clear();
         #[cfg(target_os = "linux")]
-        let (len, stride, from) = self
-            .socket
-            .async_io(tokio::io::Interest::READABLE, || {
-                gro::recv(&self.socket, &mut rx.buf)
-            })
-            .await?;
+        {
+            let (len, stride, from) = self
+                .socket
+                .async_io(tokio::io::Interest::READABLE, || {
+                    gro::recv(&self.socket, &mut rx.buf)
+                })
+                .await?;
+            let from = unmap(from);
+            let stride = stride.max(1);
+            rx.datagrams.extend(
+                (0..len)
+                    .step_by(stride)
+                    .map(|at| (from, at..len.min(at + stride))),
+            );
+        }
         #[cfg(not(target_os = "linux"))]
-        let (len, stride, from) = {
-            let (n, from) = self.socket.recv_from(&mut rx.buf).await?;
-            (n, n, from)
-        };
-        rx.len = len;
-        rx.stride = stride;
-        rx.from = unmap(from);
+        {
+            let (n, from) = self.socket.recv_from(&mut rx.buf[..MAX_DATAGRAM]).await?;
+            rx.datagrams.push((unmap(from), 0..n));
+            let mut at = n;
+            while rx.datagrams.len() < DRAIN && at + MAX_DATAGRAM <= rx.buf.len() {
+                match self
+                    .socket
+                    .try_recv_from(&mut rx.buf[at..at + MAX_DATAGRAM])
+                {
+                    Ok((n, from)) => {
+                        rx.datagrams.push((unmap(from), at..at + n));
+                        at += n;
+                    }
+                    // WouldBlock, or an error the next recv_from reports.
+                    Err(_) => break,
+                }
+            }
+        }
         Ok(())
     }
 
@@ -345,8 +374,10 @@ mod tests {
             client.send_to(b"ping", &to).await.unwrap();
             let mut rx = UdpRx::default();
             server.recv_batch(&mut rx).await.unwrap();
-            assert_eq!(rx.datagrams().collect::<Vec<_>>(), [b"ping"]);
-            let from = rx.from();
+            let got: Vec<_> = rx.datagrams().collect();
+            assert_eq!(got.len(), 1);
+            let (from, datagram) = got[0];
+            assert_eq!(datagram, b"ping");
             assert_eq!(
                 from,
                 client.local_addr().unwrap(),
@@ -362,6 +393,51 @@ mod tests {
 
     /// One send_run of four datagrams arrives as four datagrams, whether or
     /// not GSO and GRO batched them on the way.
+    /// Datagrams queued from two senders before we wake all arrive, each
+    /// with its own source, however many wakeups it takes.
+    #[tokio::test]
+    async fn a_burst_from_several_senders_keeps_each_source() {
+        let server = Udp::bind(0, None).unwrap();
+        let to = SocketAddr::from((Ipv4Addr::LOCALHOST, server.local_addr().unwrap().port()));
+        let (a, b) = (
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        );
+        for i in 0..10u8 {
+            a.send_to(&[b'a', i], to).await.unwrap();
+            b.send_to(&[b'b', i], to).await.unwrap();
+        }
+        // macOS can hand loopback datagrams over a moment after send returns.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut got = Vec::new();
+        let mut rx = UdpRx::default();
+        while got.len() < 20 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server.recv_batch(&mut rx),
+            )
+            .await
+            .expect("all twenty should arrive")
+            .unwrap();
+            let before = got.len();
+            got.extend(rx.datagrams().map(|(from, d)| (from, d.to_vec())));
+            // Everything was queued before the first wakeup, which takes
+            // it all whether by GRO (one sender per read) or draining.
+            if before == 0 && cfg!(not(target_os = "linux")) {
+                assert_eq!(got.len(), 20, "one wakeup drains the queue");
+            }
+        }
+        for (sock, tag) in [(&a, b'a'), (&b, b'b')] {
+            let from = sock.local_addr().unwrap();
+            let mine: Vec<_> = got
+                .iter()
+                .filter(|(f, _)| *f == from)
+                .map(|(_, d)| d.clone())
+                .collect();
+            assert_eq!(mine, (0..10u8).map(|i| vec![tag, i]).collect::<Vec<_>>());
+        }
+    }
+
     #[tokio::test]
     async fn runs_arrive_as_separate_datagrams() {
         let a = Udp::bind(0, None).unwrap();
@@ -381,7 +457,7 @@ mod tests {
                 .await
                 .expect("all four should arrive")
                 .unwrap();
-            got.extend(rx.datagrams().map(|d| (d[0], d.len())));
+            got.extend(rx.datagrams().map(|(_, d)| (d[0], d.len())));
         }
         assert_eq!(got, [(0, 100), (1, 100), (2, 100), (3, 50)]);
     }

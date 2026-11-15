@@ -58,7 +58,10 @@ enum Command {
     },
 }
 
-#[tokio::main]
+// One thread: the event loop is the only busy task. On a multi-thread
+// runtime a worker polls kqueue and wakes the loop's thread through a condvar
+// for every batch, which cost macOS about a fifth of vpnd's CPU per packet.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let logs = tracing_subscriber::fmt()

@@ -6,6 +6,7 @@ on:
     paths:
       - "crates/vpn-proto/benches/**"
       - "tests/bench.sh"
+      - "tests/bench-macos.sh"
       - ".github/workflows/bench.yml"
 
 permissions:
@@ -22,3 +23,12 @@ jobs:
       - run: cargo build --release -p vpnd --locked
       - run: sudo tests/bench.sh target/release/vpnd
       - run: cargo bench -p vpn-proto --bench transport --locked
+
+  bench-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p vpnd --bins --examples --locked
+      - run: sudo tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer
