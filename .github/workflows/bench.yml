@@ -32,3 +32,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p vpnd --bins --examples --locked
       - run: sudo tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer
+      - name: TEMP profile
+        run: |
+          sudo tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer 12 &
+          sleep 6
+          pid=$(pgrep -f 'vpnd up' | head -1)
+          sudo sample "$pid" 4 -file /tmp/vpnd.sample > /dev/null 2>&1 || true
+          wait
+          sed -n '/Sort by top of stack/,/Binary Images/p' /tmp/vpnd.sample | head -45
