@@ -1,5 +1,6 @@
 //! A tunnel peer with no TUN device: it answers ICMP echo requests that
-//! arrive through the tunnel, and DNS queries for A records with 192.0.2.53. Lets one machine test a real vpnd end to end
+//! arrive through the tunnel, echoes UDP to port 7 (for throughput tests),
+//! and answers DNS queries for A records with 192.0.2.53. Lets one machine test a real vpnd end to end
 //! (ping goes into the OS's tunnel interface, through vpnd, here, and back)
 //! without a second host or a second interface.
 //!
@@ -52,7 +53,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Dest::Udp(to) => {
                         socket.send_to(bytes, to)?;
                     }
-                    Dest::Tun => replies.extend(echo_reply(bytes).or_else(|| dns_reply(bytes))),
+                    Dest::Tun => replies.extend(
+                        echo_reply(bytes)
+                            .or_else(|| udp_echo(bytes))
+                            .or_else(|| dns_reply(bytes)),
+                    ),
                 }
             }
             out.clear();
@@ -78,6 +83,24 @@ fn echo_reply(packet: &[u8]) -> Option<Vec<u8>> {
     p[ihl + 2..ihl + 4].fill(0);
     let sum = checksum(&p[ihl..]);
     p[ihl + 2..ihl + 4].copy_from_slice(&sum.to_be_bytes());
+    Some(p)
+}
+
+/// Sends an IPv4 UDP datagram to port 7 back where it came from. Swapping
+/// both addresses and both ports leaves both checksums valid.
+fn udp_echo(packet: &[u8]) -> Option<Vec<u8>> {
+    let ihl = usize::from(packet.first()? & 0x0f) * 4;
+    if packet[0] >> 4 != 4 || packet.get(9) != Some(&17) || packet.len() < ihl + 8 {
+        return None;
+    }
+    if u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]) != 7 {
+        return None;
+    }
+    let mut p = packet.to_vec();
+    p[12..16].copy_from_slice(&packet[16..20]);
+    p[16..20].copy_from_slice(&packet[12..16]);
+    p[ihl..ihl + 2].copy_from_slice(&packet[ihl + 2..ihl + 4]);
+    p[ihl + 2..ihl + 4].copy_from_slice(&packet[ihl..ihl + 2]);
     Some(p)
 }
 
