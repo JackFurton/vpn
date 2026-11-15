@@ -37,9 +37,9 @@ impl PacketDevice for Tun {
     }
 }
 
-/// Below this many bytes of crypto, with nothing else in flight, a batch is
-/// done inline: handing it to a worker would only add latency.
-/// Tests use the workers for any crypto at all.
+/// With nothing else in flight, a batch with less crypto than this runs it
+/// inline, so a lone ping doesn't pay for two thread wakeups. Tests use the
+/// workers for any crypto at all.
 const INLINE_BYTES: usize = if cfg!(test) { 1 } else { 8 * 1024 };
 
 /// Runs until `shutdown` resolves or the TUN device fails. `on_endpoints`
@@ -197,6 +197,8 @@ impl Pipeline {
         let seq = self.next_seq;
         self.next_seq += 1;
         match &self.workers {
+            // Raising the bar (offload only 16 KB and up) cut Linux from 10.3
+            // to 7.7 Gbit/s: plenty of batches under load are smaller.
             Some(pool) if self.in_flight() > 1 || out.crypto_bytes() >= INLINE_BYTES => {
                 let done = self.done_tx.clone();
                 pool.spawn(move || {

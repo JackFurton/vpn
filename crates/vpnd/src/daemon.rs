@@ -73,8 +73,18 @@ pub async fn up(
     let dns = crate::dns::apply(&iface.dns, tun.name())?;
     crate::privdrop::drop_privileges(user)?;
     let on_endpoints = |eps| installed.update_endpoints(eps);
-    let threads = std::thread::available_parallelism().map_or(1, usize::from);
-    let threads = std::env::var("VPND_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(threads); // TEMP
+    // Crypto workers pay off where a wakeup brings tens of packets (Linux
+    // offload). Elsewhere it's a few, and handing those to another thread
+    // made macOS slower, so it keeps everything on one.
+    let threads = if cfg!(target_os = "linux") {
+        std::thread::available_parallelism().map_or(1, usize::from)
+    } else {
+        1
+    };
+    let threads = std::env::var("VPND_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(threads); // TEMP
     let result = event_loop::run(
         device,
         &tun,
