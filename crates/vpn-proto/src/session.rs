@@ -1,9 +1,7 @@
 //! An established session: encrypts outgoing IP packets into data messages and
 //! authenticates incoming ones, in the order docs/protocol.md requires.
 
-use chacha20poly1305::aead::inout::InOutBuf;
-use chacha20poly1305::aead::{AeadInOut, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
+use aws_lc_rs::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use zeroize::Zeroizing;
 
 use crate::replay::{REJECT_AFTER_MESSAGES, ReplayWindow};
@@ -46,9 +44,10 @@ pub struct Session {
     pub local_index: u32,
     /// Index the peer chose. We address packets to them with it.
     pub remote_index: u32,
-    // Both wipe their keys on drop (chacha20poly1305's `zeroize` feature).
-    send: ChaCha20Poly1305,
-    recv: ChaCha20Poly1305,
+    // AWS-LC keeps each key in a context it allocated, and its allocator
+    // cleanses memory on free, so dropping these wipes the keys.
+    send: LessSafeKey,
+    recv: LessSafeKey,
     pub(crate) send_counter: u64,
     replay: ReplayWindow,
     confirmed: bool,
@@ -65,7 +64,11 @@ pub(crate) struct Keys {
 fn nonce(counter: u64) -> Nonce {
     let mut n = [0u8; 12];
     n[4..].copy_from_slice(&counter.to_le_bytes());
-    Nonce::from(n)
+    Nonce::assume_unique_for_key(n)
+}
+
+fn key(bytes: &[u8; 32]) -> LessSafeKey {
+    LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, bytes).expect("32-byte key"))
 }
 
 impl Session {
@@ -73,8 +76,8 @@ impl Session {
         Self {
             local_index,
             remote_index,
-            send: ChaCha20Poly1305::new_from_slice(&*keys.send).expect("32-byte key"),
-            recv: ChaCha20Poly1305::new_from_slice(&*keys.recv).expect("32-byte key"),
+            send: key(&keys.send),
+            recv: key(&keys.recv),
             send_counter: 0,
             replay: ReplayWindow::new(),
             // The responder can't know the initiator derived the same keys
@@ -130,9 +133,9 @@ impl Session {
         body[packet.len()..].fill(0);
         let tag = self
             .send
-            .encrypt_inout_detached(&nonce(counter), &[], body.into())
+            .seal_in_place_separate_tag(nonce(counter), Aad::empty(), body)
             .map_err(|_| TransportError::Encrypt)?;
-        tag_out.copy_from_slice(&tag);
+        tag_out.copy_from_slice(tag.as_ref());
         self.send_counter += 1;
         Ok(len)
     }
@@ -159,14 +162,12 @@ impl Session {
         }
 
         let (ciphertext, tag) = msg.ciphertext.split_at(msg.ciphertext.len() - TAG_LEN);
-        let tag: [u8; TAG_LEN] = tag.try_into().expect("split at TAG_LEN");
         let need = ciphertext.len();
         let got = out.len();
         let out = out.get_mut(..need).ok_or(BufferTooSmall { need, got })?;
         // Decrypts straight from the datagram into `out`, no copy first.
-        let buf = InOutBuf::new(ciphertext, out).expect("same length");
         self.recv
-            .decrypt_inout_detached(&nonce(msg.counter), &[], buf, &Tag::from(tag))
+            .open_separate_gather(nonce(msg.counter), Aad::empty(), ciphertext, tag, out)
             .map_err(|_| TransportError::Decrypt)?;
 
         // Only now is the counter trustworthy enough to move the window.
