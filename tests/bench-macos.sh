@@ -4,7 +4,7 @@
 # to echo_peer, which echoes port 7 back, so every datagram crosses vpnd
 # twice: encrypted on the way out, decrypted on the way back. echo_peer
 # does the same crypto, so check vpnd's CPU to see which side is the limit.
-# Needs root and python3. Build both with --release first.
+# Needs root and python3. Build first: cargo build --release -p vpnd --bins --examples
 # Usage: sudo tests/bench-macos.sh target/release/vpnd target/release/examples/echo_peer [seconds]
 set -euo pipefail
 
