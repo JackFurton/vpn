@@ -35,6 +35,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # aws-lc-sys compiles C, and a static binary needs musl's compiler for it.
+      - name: musl C compiler
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          echo "CC_$(echo '${{ matrix.target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
       - run: cargo build --release --locked -p vpnd --target ${{ matrix.target }}
       - name: Smoke test
         run: |
