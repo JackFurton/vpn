@@ -13,7 +13,8 @@ both on a GitHub runner, on demand and on PRs that touch the benchmarks:
 https://github.com/JackFurton/vpn/actions/workflows/bench.yml
 
 Numbers below were recorded on 2026-11-14: the protocol core at v0.2.0,
-the tunnels after the socket buffer change below. Re-run before trusting them for anything newer.
+the M5 tunnels after the socket buffer change below, the runner's after #68
+(the buffer change didn't move it, see below). Re-run before trusting them for anything newer.
 
 ## Protocol core
 
@@ -127,3 +128,7 @@ with SO_RCVBUFFORCE so `net.core.rmem_max` doesn't cap it while vpnd is
 still root. Same run afterwards: no drops, no retransmits, 2.37 to 3.98
 Gbit/s, and both ends at 90 to 100% of a core. From here one core of
 crypto is the limit (#70).
+
+The runner was already CPU bound at about 105% per vpnd, so it stayed put:
+2.49 Gbit/s against kernel WireGuard's 2.08 on an EPYC 9V74, the same ratio
+as before.
