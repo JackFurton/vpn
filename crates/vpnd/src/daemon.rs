@@ -110,11 +110,7 @@ pub async fn up(
         }
     };
     tracing::info!(path = %control_path.display(), "listening for reloads");
-    let control_task = tokio::spawn(crate::control::serve(
-        listener,
-        control_path.clone(),
-        reload,
-    ));
+    let control_task = tokio::spawn(crate::control::serve(listener, reload));
 
     let on_endpoints = |eps| installed.update_endpoints(eps);
     // Crypto workers pay off where a wakeup brings tens of packets (Linux

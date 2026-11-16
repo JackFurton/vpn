@@ -38,11 +38,18 @@ pub fn default_path(interface: &str) -> PathBuf {
         .join(format!("{interface}.sock"))
 }
 
+pub struct Listener {
+    inner: UnixListener,
+    /// Who owned the socket when it was made. Read now, because after
+    /// dropping privilege vpnd may not be able to look at it.
+    owner: u32,
+}
+
 /// Binds `path`, owner-only. Call while still privileged: once vpnd drops
 /// to its own user, the socket stays owned by root, so only root can
 /// connect. A socket left by a vpnd that's gone is replaced; one that still
 /// answers is an error, since two daemons can't share it.
-pub fn bind(path: &Path) -> Result<UnixListener> {
+pub fn bind(path: &Path) -> Result<Listener> {
     if let Some(dir) = path.parent()
         && !dir.exists()
     {
@@ -58,20 +65,20 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
         }
         _ => {}
     }
-    let listener =
-        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    let inner = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+    let owner = std::fs::metadata(path)?.uid();
+    Ok(Listener { inner, owner })
 }
 
 /// Answers requests one at a time. `reload` gets each new config and
 /// returns the lines to send back, or the reason it refused.
-pub async fn serve<F>(listener: UnixListener, path: PathBuf, mut reload: impl FnMut(Config) -> F)
+pub async fn serve<F>(listener: Listener, mut reload: impl FnMut(Config) -> F)
 where
     F: Future<Output = Result<Vec<String>, String>>,
 {
     loop {
-        let stream = match listener.accept().await {
+        let mut stream = match listener.inner.accept().await {
             Ok((stream, _)) => stream,
             Err(e) => {
                 tracing::warn!(%e, "control socket accept failed");
@@ -79,43 +86,40 @@ where
                 continue;
             }
         };
-        let (mut stream, text) =
-            match tokio::time::timeout(REQUEST_TIMEOUT, read(stream, &path)).await {
-                Ok(Ok(request)) => request,
-                Ok(Err(e)) => {
-                    tracing::debug!(%e, "bad control request");
-                    continue;
-                }
-                Err(_) => continue,
-            };
-        let answer = match parse(&text) {
-            Ok(config) => reload(config).await,
-            Err(e) => Err(e),
+        let request = tokio::time::timeout(REQUEST_TIMEOUT, read(&mut stream, listener.owner))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out reading the request")));
+        let answer = match request {
+            Ok(text) => match parse(&text) {
+                Ok(config) => reload(config).await,
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(format!("{e:#}")),
         };
         let text = match answer {
             Ok(notes) => std::iter::once("ok".to_string())
                 .chain(notes)
                 .collect::<Vec<_>>(),
-            Err(why) => vec!["error".to_string(), why],
+            Err(why) => {
+                tracing::warn!("control request refused: {why}");
+                vec!["error".to_string(), why]
+            }
         };
         let _ = stream.write_all((text.join("\n") + "\n").as_bytes()).await;
     }
 }
 
-async fn read(stream: UnixStream, path: &Path) -> Result<(UnixStream, Zeroizing<String>)> {
+async fn read(stream: &mut UnixStream, owner: u32) -> Result<Zeroizing<String>> {
     // The socket file's permissions already keep others out. This is in
     // case they're ever looser than intended.
     let uid = stream.peer_cred()?.uid();
-    let owner = std::fs::metadata(path)?.uid();
     if uid != 0 && uid != owner {
-        bail!("refusing uid {uid}");
+        bail!("uid {uid} may not control vpnd");
     }
     let mut buf = Zeroizing::new(Vec::new());
-    let mut limited = stream.take(MAX_REQUEST);
-    limited.read_to_end(&mut buf).await?;
-    let stream = limited.into_inner();
-    let text = String::from_utf8(std::mem::take(&mut *buf)).context("not UTF-8")?;
-    Ok((stream, Zeroizing::new(text)))
+    stream.take(MAX_REQUEST).read_to_end(&mut buf).await?;
+    let text = String::from_utf8(std::mem::take(&mut *buf)).context("request isn't UTF-8")?;
+    Ok(Zeroizing::new(text))
 }
 
 fn parse(text: &str) -> Result<Config, String> {
@@ -240,7 +244,7 @@ mod tests {
         );
         assert!(bind(&path).is_err(), "a live socket isn't replaced");
 
-        let server = tokio::spawn(serve(listener, path.clone(), |c: Config| async move {
+        let server = tokio::spawn(serve(listener, |c: Config| async move {
             Ok(vec![format!("{} peers", c.peers.len())])
         }));
         let key = KeyPair::generate().unwrap().private.to_base64();
@@ -256,5 +260,34 @@ mod tests {
         let _ = server.await;
         bind(&path).expect("a dead socket is replaced");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// After dropping privilege vpnd may be locked out of the socket's
+    /// directory (in Docker it made it 0700 as root), and must still answer.
+    #[tokio::test]
+    async fn answers_without_access_to_the_socket_directory() {
+        let dir = std::env::temp_dir().join(format!("vpnd-locked-{}", std::process::id()));
+        let path = dir.join("test.sock");
+        let listener = bind(&path).unwrap();
+        let client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let server = tokio::spawn(serve(listener, |_: Config| async { Ok(vec![]) }));
+        client.set_nonblocking(true).unwrap();
+        let mut client = UnixStream::from_std(client).unwrap();
+        let key = KeyPair::generate().unwrap().private.to_base64();
+        let request = format!(
+            "reload\n[interface]\nprivate_key = \"{key}\"\naddresses = [\"10.9.0.1/24\"]\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut reply = String::new();
+        let read = client.read_to_string(&mut reply).await;
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        server.abort();
+        std::fs::remove_dir_all(&dir).unwrap();
+        read.unwrap();
+        assert_eq!(reply, "ok\n");
     }
 }
