@@ -7,9 +7,9 @@ use std::io;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
-use vpn_proto::device::{Dest, Device, Outbox};
+use vpn_proto::device::{Dest, Device, Outbox, PeerChanges, PeerConfig};
 use vpn_proto::session::Session;
 
 use crate::tun::{Tun, TunRx, TunTx};
@@ -42,6 +42,11 @@ impl PacketDevice for Tun {
 /// workers for any crypto at all.
 const INLINE_BYTES: usize = if cfg!(test) { 1 } else { 8 * 1024 };
 
+/// Changes to a running device, from the control socket.
+pub enum Command {
+    SetPeers(Vec<PeerConfig>, oneshot::Sender<PeerChanges>),
+}
+
 /// Runs until `shutdown` resolves or the TUN device fails. `on_endpoints`
 /// gets every peer endpoint whenever one moves. `threads` counts this one,
 /// so with more than one, the rest encrypt and decrypt while this one keeps
@@ -54,6 +59,7 @@ pub async fn run(
     mtu: usize,
     threads: usize,
     metrics: Option<watch::Sender<String>>,
+    mut commands: mpsc::Receiver<Command>,
     mut on_endpoints: impl FnMut(Vec<IpAddr>),
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
@@ -89,6 +95,14 @@ pub async fn run(
                 Err(e) => tracing::debug!(%e, "UDP receive error"),
             },
             Some((seq, out)) = pipeline.done.recv() => pipeline.crypto_done(seq, out),
+            Some(command) = commands.recv() => match command {
+                Command::SetPeers(peers, reply) => {
+                    let _ = reply.send(device.set_peers(peers));
+                    if device.take_endpoints_changed() {
+                        on_endpoints(device.endpoints().map(|e| e.ip()).collect());
+                    }
+                }
+            },
             _ = ticker.tick() => {
                 let now = Instant::now();
                 device.tick(now, &mut tick_out);
@@ -271,6 +285,7 @@ mod tests {
         inject: mpsc::Sender<Vec<u8>>,
         delivered: mpsc::Receiver<Vec<u8>>,
         stop: oneshot::Sender<()>,
+        commands: mpsc::Sender<Command>,
         task: tokio::task::JoinHandle<io::Result<()>>,
     }
 
@@ -278,20 +293,32 @@ mod tests {
         let (inject, from_kernel) = mpsc::channel(16);
         let (to_kernel, delivered) = mpsc::channel(16);
         let (stop, stopped) = oneshot::channel();
+        let (commands, command_rx) = mpsc::channel(1);
         let task = tokio::spawn(async move {
             let tun = ChannelTun {
                 from_kernel: Mutex::new(from_kernel),
                 to_kernel,
             };
-            run(device, &tun, &udp, 1420, threads, None, |_| {}, async {
-                let _ = stopped.await;
-            })
+            run(
+                device,
+                &tun,
+                &udp,
+                1420,
+                threads,
+                None,
+                command_rx,
+                |_| {},
+                async {
+                    let _ = stopped.await;
+                },
+            )
             .await
         });
         Side {
             inject,
             delivered,
             stop,
+            commands,
             task,
         }
     }
@@ -359,6 +386,25 @@ mod tests {
             assert_eq!(next(&mut a).await, pong);
             stop([a, b]).await;
         }
+    }
+
+    #[tokio::test]
+    async fn set_peers_reaches_the_running_device() {
+        let (a, mut b) = pair(1);
+        let ping = ipv4([10, 0, 0, 1], [10, 0, 0, 2]);
+        a.inject.send(ping.clone()).await.unwrap();
+        assert_eq!(next(&mut b).await, ping);
+
+        let (reply, changes) = oneshot::channel();
+        b.commands
+            .send(Command::SetPeers(vec![], reply))
+            .await
+            .unwrap();
+        assert_eq!(changes.await.unwrap().removed, 1);
+        a.inject.send(ping.clone()).await.unwrap();
+        let late = tokio::time::timeout(Duration::from_millis(300), b.delivered.recv()).await;
+        assert!(late.is_err(), "B no longer knows A");
+        stop([a, b]).await;
     }
 
     /// Workers finish batches in any order; the far side still gets every

@@ -373,6 +373,14 @@ pub struct PeerConfig {
     pub persistent_keepalive: Option<Duration>,
 }
 
+/// What `Device::set_peers` did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PeerChanges {
+    pub added: usize,
+    pub removed: usize,
+    pub kept: usize,
+}
+
 struct Attempt {
     /// None after a response failed to authenticate; `tick` retries.
     initiator: Option<Initiator>,
@@ -409,6 +417,9 @@ enum Which {
 struct Peer {
     public_key: PublicKey,
     endpoint: Option<SocketAddr>,
+    /// The endpoint the config gave, which `endpoint` roams away from.
+    configured_endpoint: Option<SocketAddr>,
+    allowed_ips: Vec<IpNet>,
     persistent_keepalive: Option<Duration>,
     /// Confirmed session we send on.
     current: Option<Slot>,
@@ -436,6 +447,29 @@ struct Peer {
 }
 
 impl Peer {
+    fn new(c: PeerConfig) -> Self {
+        Self {
+            keys: MacKeys::new(&c.public_key),
+            cookie: None,
+            counters: PeerCounters::default(),
+            last_handshake: None,
+            public_key: c.public_key,
+            endpoint: c.endpoint,
+            configured_endpoint: c.endpoint,
+            allowed_ips: c.allowed_ips,
+            persistent_keepalive: c.persistent_keepalive,
+            current: None,
+            previous: None,
+            next: None,
+            attempt: None,
+            last_init: None,
+            queue: VecDeque::new(),
+            last_sent: None,
+            awaiting_reply: None,
+            owe_keepalive: None,
+        }
+    }
+
     fn slot(&mut self, which: Which) -> &mut Option<Slot> {
         match which {
             Which::Current => &mut self.current,
@@ -557,24 +591,57 @@ impl Device {
             self.routes.insert(*net, i);
         }
         self.by_key.insert(c.public_key.clone(), i);
-        self.peers.push(Peer {
-            keys: MacKeys::new(&c.public_key),
-            cookie: None,
-            counters: PeerCounters::default(),
-            last_handshake: None,
-            public_key: c.public_key,
-            endpoint: c.endpoint,
-            persistent_keepalive: c.persistent_keepalive,
-            current: None,
-            previous: None,
-            next: None,
-            attempt: None,
-            last_init: None,
-            queue: VecDeque::new(),
-            last_sent: None,
-            awaiting_reply: None,
-            owe_keepalive: None,
-        });
+        self.peers.push(Peer::new(c));
+    }
+
+    /// Makes the peer list match `peers`, by public key. Peers that stay
+    /// keep their sessions and queues and take the new allowed_ips and
+    /// keepalive. Their endpoint only changes if the configured one did, so
+    /// a reload doesn't undo roaming. Removed peers' sessions are dropped.
+    pub fn set_peers(&mut self, peers: Vec<PeerConfig>) -> PeerChanges {
+        let mut old: HashMap<PublicKey, Peer> = std::mem::take(&mut self.peers)
+            .into_iter()
+            .map(|p| (p.public_key.clone(), p))
+            .collect();
+        let mut changes = PeerChanges::default();
+        for c in peers {
+            let Some(mut peer) = old.remove(&c.public_key) else {
+                changes.added += 1;
+                self.endpoints_changed |= c.endpoint.is_some();
+                self.peers.push(Peer::new(c));
+                continue;
+            };
+            if c.endpoint != peer.configured_endpoint {
+                if let Some(to) = c.endpoint {
+                    self.endpoints_changed |= move_endpoint(&mut peer.endpoint, to);
+                }
+                peer.configured_endpoint = c.endpoint;
+            }
+            peer.persistent_keepalive = c.persistent_keepalive;
+            peer.allowed_ips = c.allowed_ips;
+            changes.kept += 1;
+            self.peers.push(peer);
+        }
+        changes.removed = old.len();
+        self.endpoints_changed |= old.values().any(|p| p.endpoint.is_some());
+
+        self.routes = AllowedIps::new();
+        self.by_key.clear();
+        self.by_index.clear();
+        for (i, p) in self.peers.iter().enumerate() {
+            for net in &p.allowed_ips {
+                self.routes.insert(*net, i);
+            }
+            self.by_key.insert(p.public_key.clone(), i);
+            let sessions = [&p.current, &p.previous, &p.next]
+                .into_iter()
+                .flatten()
+                .map(|s| s.session.local_index);
+            for index in sessions.chain(p.pending_index()) {
+                self.by_index.insert(index, i);
+            }
+        }
+        changes
     }
 
     /// Whether any peer's endpoint changed since the last call. The host
@@ -1991,5 +2058,105 @@ mod tests {
         // Same, with the init in the next batch while the first is in flight.
         let (mut net, data, init) = data_then_init();
         assert_eq!(open_pipelined(&mut net, &[&[data], &[init]]), [to_b(1)]);
+    }
+
+    /// A's config for B, as `Net::new` sets it up.
+    fn b_at_a(net: &Net) -> PeerConfig {
+        PeerConfig {
+            public_key: net.b_private.public_key(),
+            endpoint: Some(B),
+            allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }
+    }
+
+    fn other_peer() -> PeerConfig {
+        PeerConfig {
+            public_key: KeyPair::generate().unwrap().public,
+            endpoint: Some("192.0.2.3:3000".parse().unwrap()),
+            allowed_ips: vec!["10.0.0.3/32".parse().unwrap()],
+            persistent_keepalive: None,
+        }
+    }
+
+    #[test]
+    fn reload_keeps_sessions_of_peers_that_stay() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        // The new peer goes first, so B's position in the list moves.
+        let changes = net.a.set_peers(vec![other_peer(), b_at_a(&net)]);
+        assert_eq!(
+            changes,
+            PeerChanges {
+                added: 1,
+                removed: 0,
+                kept: 1
+            }
+        );
+
+        let (_, at_b) = net.send_a(&to_b(2));
+        assert_eq!(at_b, vec![to_b(2)]);
+        let (at_a, _) = net.send_b(&to_a(3));
+        assert_eq!(at_a, vec![to_a(3)], "B's index and source still map to B");
+        assert_eq!(net.sent, [1, 2, 4, 4, 4], "no new handshake");
+    }
+
+    #[test]
+    fn removed_peer_is_forgotten() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        net.a.take_endpoints_changed();
+        let changes = net.a.set_peers(vec![]);
+        assert_eq!(changes.removed, 1);
+        assert!(net.a.by_index.is_empty());
+        assert!(net.a.take_endpoints_changed(), "B's endpoint is gone");
+        assert_eq!(net.a.endpoints().count(), 0);
+
+        let (at_a, _) = net.send_b(&to_a(2));
+        assert!(at_a.is_empty(), "B's session went with it");
+        assert_eq!(drops(&net.a, DropReason::UnknownSession), 1);
+    }
+
+    #[test]
+    fn reload_applies_new_allowed_ips() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        let mut b = b_at_a(&net);
+        b.allowed_ips = vec!["10.0.0.9/32".parse().unwrap()];
+        net.a.set_peers(vec![b]);
+
+        net.send_a(&to_b(2));
+        assert_eq!(drops(&net.a, DropReason::NoRoute), 1);
+        let (at_a, _) = net.send_b(&to_a(3));
+        assert!(at_a.is_empty());
+        assert_eq!(drops(&net.a, DropReason::SourceNotAllowed), 1);
+    }
+
+    #[test]
+    fn reload_keeps_a_roamed_endpoint_unless_the_config_moved() {
+        let mut net = Net::new();
+        net.send_a(&to_b(1));
+        let moved: SocketAddr = "198.51.100.9:3000".parse().unwrap();
+        let mut out = Outbox::new();
+        net.b.handle_tun(&to_a(2), net.now, &mut out);
+        let (_, wire) = out.iter().next().unwrap();
+        net.a.handle_udp(wire, moved, net.now, &mut Outbox::new());
+        assert_eq!(net.a.peers[0].endpoint, Some(moved));
+        net.a.take_endpoints_changed();
+
+        net.a.set_peers(vec![b_at_a(&net)]);
+        assert_eq!(
+            net.a.peers[0].endpoint,
+            Some(moved),
+            "same config, B is still where it roamed"
+        );
+        assert!(!net.a.take_endpoints_changed());
+
+        let elsewhere: SocketAddr = "192.0.2.50:2000".parse().unwrap();
+        let mut b = b_at_a(&net);
+        b.endpoint = Some(elsewhere);
+        net.a.set_peers(vec![b]);
+        assert_eq!(net.a.peers[0].endpoint, Some(elsewhere));
+        assert!(net.a.take_endpoints_changed());
     }
 }

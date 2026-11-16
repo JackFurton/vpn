@@ -54,7 +54,7 @@ $endpoint
 allowed_ips = ["10.8.0.$m/32"]
 CONF
   chmod 600 "$WORK/$side.toml"
-  ip netns exec bench-$side "$VPND" up -c "$WORK/$side.toml" -i tun0 > "$WORK/vpnd-$side.log" 2>&1 &
+  ip netns exec bench-$side "$VPND" up -c "$WORK/$side.toml" -i tun0 --control "$WORK/$side.sock" > "$WORK/vpnd-$side.log" 2>&1 &
   pids+=($!)
 done
 

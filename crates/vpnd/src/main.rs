@@ -44,6 +44,22 @@ enum Command {
         /// vpnd started as root. Linux only.
         #[arg(short, long)]
         user: Option<String>,
+        /// Socket `vpnd reload` connects to. Defaults to
+        /// /run/vpnd/INTERFACE.sock (/var/run on macOS).
+        #[arg(long)]
+        control: Option<PathBuf>,
+    },
+    /// Apply a changed config's peers to a running tunnel without dropping
+    /// sessions. Interface settings still need a restart.
+    Reload {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The running tunnel's interface.
+        #[arg(short, long, required_unless_present = "control")]
+        interface: Option<String>,
+        /// The running tunnel's control socket, if `up` was given one.
+        #[arg(long)]
+        control: Option<PathBuf>,
     },
     /// Create a TUN device and log every packet the kernel routes into it
     #[command(hide = true)]
@@ -90,15 +106,36 @@ async fn main() -> Result<()> {
             config,
             interface,
             user,
+            control,
         } => {
             let config = Config::load(&config)?;
             daemon::up(
                 config,
                 interface.as_deref(),
                 user.as_deref(),
+                control.as_deref(),
                 daemon::shutdown_signal(),
             )
             .await?;
+        }
+        Command::Reload {
+            config,
+            interface,
+            control,
+        } => {
+            let text = zeroize::Zeroizing::new(
+                std::fs::read_to_string(&config)
+                    .with_context(|| format!("reading {}", config.display()))?,
+            );
+            // Catch mistakes here, with the file name, rather than as a
+            // refusal from the daemon.
+            Config::parse(&text).with_context(|| format!("in {}", config.display()))?;
+            let path = control.unwrap_or_else(|| {
+                vpnd::control::default_path(interface.as_deref().expect("clap requires one"))
+            });
+            for note in vpnd::control::reload(&path, &text).await? {
+                println!("{note}");
+            }
         }
         Command::TunDump {
             addresses,

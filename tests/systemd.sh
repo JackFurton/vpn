@@ -19,6 +19,7 @@ cleanup() {
   fi
   systemctl stop "$UNIT" 2>/dev/null || true
   [ -n "${ECHO_PID:-}" ] && kill "$ECHO_PID" 2>/dev/null || true
+  [ -n "${ECHO2_PID:-}" ] && kill "$ECHO2_PID" 2>/dev/null || true
   rm -f /etc/systemd/system/vpnd@.service /etc/vpnd/vpntest.toml /etc/sysusers.d/vpnd.conf
   systemctl daemon-reload
   exit $status
@@ -45,7 +46,7 @@ dns = ["10.99.0.1"]
 [[peer]]
 public_key = "$peer"
 endpoint = "127.0.0.1:51898"
-allowed_ips = ["10.99.0.0/24"]
+allowed_ips = ["10.99.0.1/32"]
 CONF
 chmod 600 /etc/vpnd/vpntest.toml
 install -D -m 644 "$REPO/packaging/sysusers.d/vpnd.conf" /etc/sysusers.d/vpnd.conf
@@ -80,12 +81,30 @@ resolvectl dns vpntest | tee /dev/stderr | grep -q 10.99.0.1
 probe="probe-$$-$RANDOM.vpnd.test"
 resolvectl query --cache=no "$probe" | tee /dev/stderr | grep -q 192.0.2.53
 
+echo "== reload adds a peer without a restart"
+echo2_priv=$(vpnd keygen | awk '$1 == "private:" { print $2 }')
+"$ECHO" 127.0.0.1:51897 "$echo2_priv" "$pub" 0.0.0.0/0 2>/dev/null &
+ECHO2_PID=$!
+if ping -c 1 -W 1 10.99.0.3 > /dev/null; then echo "10.99.0.3 answered before it was added"; exit 1; fi
+cat >> /etc/vpnd/vpntest.toml <<CONF
+
+[[peer]]
+public_key = "$(echo "$echo2_priv" | vpnd pubkey)"
+endpoint = "127.0.0.1:51897"
+allowed_ips = ["10.99.0.3/32"]
+CONF
+systemctl reload "$UNIT"
+[ "$(systemctl show -p MainPID --value "$UNIT")" = "$pid" ] || { echo "reload restarted vpnd"; exit 1; }
+journalctl -u "$UNIT" -o cat | grep "reloaded peers" | tail -1 | tee /dev/stderr | grep -q "added=1"
+ping -c 3 -W 2 10.99.0.3
+
 echo "== systemd's exposure score"
 systemd-analyze security "$UNIT" --no-pager | tail -1
 
 echo "== stop removes the interface"
 systemctl stop "$UNIT"
-! ip link show vpntest > /dev/null 2>&1
-! resolvectl dns vpntest > /dev/null 2>&1
+# Not `! cmd`: set -e ignores a negated command's status.
+if ip link show vpntest > /dev/null 2>&1; then echo "vpntest still exists"; exit 1; fi
+if resolvectl dns vpntest > /dev/null 2>&1; then echo "vpntest still has DNS"; exit 1; fi
 
 echo "PASS"

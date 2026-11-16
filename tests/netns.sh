@@ -89,7 +89,7 @@ CONF
 chmod 600 "$WORK"/*.toml
 
 for side in a b c; do
-  RUST_LOG=${RUST_LOG:-debug} ip netns exec vpn-$side "$VPND" up -c "$WORK/$side.toml" -i tun0 > "$WORK/$side.log" 2>&1 &
+  RUST_LOG=${RUST_LOG:-debug} ip netns exec vpn-$side "$VPND" up -c "$WORK/$side.toml" -i tun0 --control "$WORK/$side.sock" > "$WORK/$side.log" 2>&1 &
 done
 for ns in vpn-a vpn-b vpn-c; do
   for _ in $(seq 50); do ip -n $ns link show tun0 > /dev/null 2>&1 && break; sleep 0.1; done

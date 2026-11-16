@@ -12,6 +12,13 @@ Type=exec
 # so the service user never needs access to /etc/vpnd.
 LoadCredential=config:/etc/vpnd/%i.toml
 ExecStart=/usr/local/bin/vpnd up -c ${CREDENTIALS_DIRECTORY}/config -i %i --user vpnd
+# systemctl reload doesn't refresh the credential, so this reads the file
+# itself (as root) and hands it to the daemon's control socket.
+ExecReload=/usr/local/bin/vpnd reload -c /etc/vpnd/%i.toml -i %i
+# For the control socket. Shared by every instance, so stopping one mustn't
+# delete it.
+RuntimeDirectory=vpnd
+RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=2s
 
