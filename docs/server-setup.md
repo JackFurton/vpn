@@ -45,6 +45,28 @@ docker run -d --cap-add NET_ADMIN --device /dev/net/tun -p 51820:51820/udp \
   -v /etc/vpnd/vpn0.toml:/etc/vpnd/vpnd.toml:ro vpnd
 ```
 
+### Adding and removing clients
+
+Edit the config, then:
+
+```sh
+sudo systemctl reload vpnd@vpn0      # or: sudo vpnd reload -c /etc/vpnd/vpn0.toml -i vpn0
+docker exec <container> vpnd reload -c /etc/vpnd/vpnd.toml -i tun0
+```
+
+Peers are matched by public key. New ones are added, missing ones are
+dropped along with their sessions, and the rest keep their sessions while
+taking any new `allowed_ips` or `persistent_keepalive`. Nobody else's
+traffic stalls. `vpnd reload` reads the file as root and sends it to the
+daemon over `/run/vpnd/<interface>.sock`, which only root can open. A
+re-read on SIGHUP couldn't work: systemd's private copy of the config
+isn't refreshed on reload, and the daemon can no longer read
+`/etc/vpnd`.
+
+`[interface]` settings, and `allowed_ips` outside the interface's subnet
+(which need an OS route), still need a restart. Reload says so when it
+sees them, and refuses a different `private_key` outright.
+
 ## 2. Turn on forwarding
 
 By default Linux only delivers packets addressed to itself and drops the
